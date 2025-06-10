@@ -109,19 +109,11 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	}
 	printf("\tUsing %lu batch(es), %lu beams per batch\n", n_batches, n_beams_in_memory);
 
-	// fill remaining memory with trajectories
-	size_t n_trajectories = gpu_bytes_free / ((sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT);
-	if (n_trajectories > consts::NRAYS) n_trajectories = consts::NRAYS;
-	size_t rays_per_thread = consts::NRAYS / n_trajectories;
-	printf("\tUsing %lu ray(s) per thread\n", rays_per_thread);
-
 	MeshPoint** cuda_mesh = new MeshPoint*[device_count];
 	Crossing** cuda_crossings = new Crossing*[device_count];
 	Xyz<double>** cuda_deden = new Xyz<double>*[device_count];
 	Xyz<double>** cuda_ref_positions = new Xyz<double>*[device_count];
 	size_t** cuda_turn = new size_t*[device_count];
-	Xyz<double>** cuda_child = new Xyz<double>*[device_count];
-	double** cuda_dist = new double*[device_count];
 
 	// NOTE: TEMPORARY: intensity offsets
 	double* TEMPoffsets = new double[consts::NRAYS];
@@ -149,6 +141,29 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		gpuErrchk(cudaMalloc(TEMPcuda_offsets + device, sizeof(double) * consts::NRAYS));
 		gpuErrchk(cudaMemcpy(TEMPcuda_offsets[device], TEMPoffsets, sizeof(double) * consts::NRAYS, cudaMemcpyHostToDevice));
 
+		gpuErrchk(cudaMemGetInfo(&real_gpu_bytes_free, NULL));
+		gpu_bytes_free = min(gpu_bytes_free, real_gpu_bytes_free);
+	}
+	
+	// fill the rest of the memory with child trajectories
+	Xyz<double>** cuda_child = new Xyz<double>*[device_count];
+	double** cuda_dist = new double*[device_count];
+
+	size_t n_trajectories = gpu_bytes_free / ((sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT);
+	if (n_trajectories > consts::NRAYS) n_trajectories = consts::NRAYS;
+	size_t rays_per_thread = CEIL_DIV(consts::NRAYS, n_trajectories);
+	n_trajectories = CEIL_DIV(consts::NRAYS, rays_per_thread);
+	// leave 1mb on gpu (i just chose a random number that sounds right)
+	// (if things break make it bigger I guess)
+	if (gpu_bytes_free - n_trajectories * (sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT < 1000000) {
+		n_trajectories--;
+		rays_per_thread = CEIL_DIV(consts::NRAYS, n_trajectories);
+		n_trajectories = CEIL_DIV(consts::NRAYS, rays_per_thread);
+	}
+	printf("\tUsing %lu ray(s) per thread\n", rays_per_thread);
+
+	for (int device = 0; device < device_count; device++) {
+		gpuErrchk(cudaSetDevice(device));
 		gpuErrchk(cudaMalloc(cuda_child + device, sizeof(Xyz<double>) * consts::NT * 2 * n_trajectories));
 		gpuErrchk(cudaMalloc(cuda_dist + device, sizeof(double) * consts::NT * 2 * n_trajectories));
 	}
