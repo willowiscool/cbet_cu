@@ -1,10 +1,12 @@
 #include <fstream>
 #include <cstddef>
 #include <cmath>
+#include <chrono>
 #include <H5Cpp.h>
+#include <iostream>
 #include "consts.hpp"
 #include "structs.hpp"
-#include "utils.hpp"
+#include "utils.cuh"
 #include "ray_trace.hpp"
 
 using namespace std;
@@ -158,15 +160,15 @@ void save_hdf5(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 }
 
 int main() {
+	printf("Running CBET with:\n\tNumber of rays per beam: %lu\n\tNumber of mesh zones: %lu (%lux%lux%lu)\n", consts::NRAYS, consts::GRID, consts::NX, consts::NY, consts::NZ);
 	// Load data from files
 	printf("Reading mesh\n");
 	MeshPoint* mesh = read_spherical_mesh();
 
-	// Create beams
+	printf("Allocating beam info on CPU\n");
 	Crossing* crossings = new Crossing[consts::NBEAMS * consts::NRAYS * consts::NCROSSINGS]();
 	size_t* turn = new size_t[consts::NBEAMS * consts::NRAYS];
-
-	printf("Tracing rays\n");
+	printf("Starting ray tracing\n");
 	ray_trace(mesh, crossings, turn);
 	
 	printf("Writing hdf5 file\n");

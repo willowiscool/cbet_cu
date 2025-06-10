@@ -11,15 +11,15 @@ namespace consts {
 	// Mesh constants
 	constexpr size_t NR = 494; // for reading spherical mesh
 
-	constexpr size_t NX = 101;
+	constexpr size_t NX = 201;
 	constexpr double XMIN = -0.14;
 	constexpr double XMAX = 0.14;
 
-	constexpr size_t NY = 101;
+	constexpr size_t NY = 201;
 	constexpr double YMIN = -0.14;
 	constexpr double YMAX = 0.14;
 
-	constexpr size_t NZ = 101;
+	constexpr size_t NZ = 201;
 	constexpr double ZMIN = -0.14;
 	constexpr double ZMAX = 0.14;
 

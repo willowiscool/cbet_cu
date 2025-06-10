@@ -1,16 +1,32 @@
 #include <cstddef>
 #include <iostream>
+#include <cassert>
+#include <chrono>
+#include "ray_trace.cuh"
 #include "ray_trace.hpp"
 #include "consts.hpp"
 #include "structs.hpp"
-#include "utils.hpp"
-#include "omega_beams.h"
+#include "utils.cuh"
+#include "omega_beams.cuh"
 
-using namespace std;
+#define CEIL_DIV(a, b) ((a+b-1)/b)
+#define THREADS_PER_BLOCK 256
+
+// https://stackoverflow.com/questions/14038589/what-is-the-canonical-way-to-check-for-errors-using-the-cuda-runtime-api
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
+	if (code != cudaSuccess) {
+		fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+		if (abort) exit(code);
+	}
+}
+
+using namespace std::literals; // for dividing times by 1.0s
 
 void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
+	auto start_time = std::chrono::high_resolution_clock::now();
 	// calculate dedens (derivative of eden wrt. x, y z)
-	Xyz<double>* deden = new Xyz<double>[consts::NX * consts::NY * consts::NZ];
+	Xyz<double>* deden = new Xyz<double>[consts::GRID];
 	for (size_t x = 1; x < consts::NX - 1; x++) {
 		for (size_t y = 1; y < consts::NY - 1; y++) {
 			for (size_t z = 1; z < consts::NZ - 1; z++) {
@@ -41,8 +57,6 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 
 	// c++ has something about phase_r and pow_r that are not used
 
-	// for memory purposes, only do one beam at a time?
-	
 	// Create reference start positions to be rotated into place
 	Xyz<double>* ref_positions = new Xyz<double>[consts::NRAYS];
 
@@ -57,11 +71,57 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		}
 	}
 
-	Xyz<double>* child1 = new Xyz<double>[consts::NT];
-	double* dist1 = new double[consts::NT];
-	Xyz<double>* child2 = new Xyz<double>[consts::NT];
-	double* dist2 = new double[consts::NT];
-	Xyz<double> k0;
+	auto time1 = std::chrono::high_resolution_clock::now();
+	printf("\tSetting up arrays took %Lf seconds\n", (time1-start_time)/1.0s);
+
+	// See how much memory we need
+	size_t real_gpu_bytes_free;
+	gpuErrchk(cudaMemGetInfo(&real_gpu_bytes_free, NULL));
+	// take out mesh size + ref positions and stuff
+	// TODO: update when removing TEMPoffsets!
+	size_t gpu_bytes_free = real_gpu_bytes_free -
+		((sizeof(MeshPoint) + sizeof(Xyz<double>)) * consts::GRID +
+		(sizeof(Xyz<double>) + sizeof(double)) * consts::NRAYS);
+	size_t n_beams_in_memory = gpu_bytes_free / ((sizeof(Crossing) * consts::NCROSSINGS + sizeof(size_t)) * consts::NRAYS);
+	size_t n_batches = CEIL_DIV(consts::NBEAMS, n_beams_in_memory);
+	n_beams_in_memory = CEIL_DIV(consts::NBEAMS, n_batches);
+
+	int device_count = 1;
+	if (n_batches > 1) {
+		gpuErrchk(cudaGetDeviceCount(&device_count));
+		device_count = min(device_count, (int)n_batches);
+		printf("\tUsing %d GPUs\n", device_count);
+		// adjust gpu memory free to fit smallest GPU
+		// NOTE: this code assumes GPUs have roughly the same memory size/free memory
+		// and this is just insurance in case one GPU is slightly less free
+		// but if one GPU is significantly smaller, THIS WHOLE THING NEEDS TO BE CHANGED!!
+		if (device_count > 1) {
+			for (int device = 0; device < device_count; device++) {
+				gpuErrchk(cudaSetDevice(device));
+				size_t this_gpu_bytes_free;
+				gpuErrchk(cudaMemGetInfo(&this_gpu_bytes_free, NULL));
+				if (this_gpu_bytes_free < real_gpu_bytes_free) {
+					gpu_bytes_free -= (real_gpu_bytes_free - this_gpu_bytes_free);
+					real_gpu_bytes_free = this_gpu_bytes_free;
+				}
+			}
+		}
+	}
+	printf("\tUsing %lu batch(es), %lu beams per batch\n", n_batches, n_beams_in_memory);
+
+	// fill remaining memory with trajectories
+	size_t n_trajectories = gpu_bytes_free / ((sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT);
+	if (n_trajectories > consts::NRAYS) n_trajectories = consts::NRAYS;
+	size_t rays_per_thread = consts::NRAYS / n_trajectories;
+	printf("\tUsing %lu ray(s) per thread\n", rays_per_thread);
+
+	MeshPoint** cuda_mesh = new MeshPoint*[device_count];
+	Crossing** cuda_crossings = new Crossing*[device_count];
+	Xyz<double>** cuda_deden = new Xyz<double>*[device_count];
+	Xyz<double>** cuda_ref_positions = new Xyz<double>*[device_count];
+	size_t** cuda_turn = new size_t*[device_count];
+	Xyz<double>** cuda_child = new Xyz<double>*[device_count];
+	double** cuda_dist = new double*[device_count];
 
 	// NOTE: TEMPORARY: intensity offsets
 	double* TEMPoffsets = new double[consts::NRAYS];
@@ -69,91 +129,175 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	for (size_t i = 0; i < consts::NRAYS; i++) {
 		TEMPoffsets[i] = consts::BEAM_MIN_Z + i * TEMPdx;
 	}
+	double** TEMPcuda_offsets = new double*[device_count];
 
-	// start ray tracing!
-	for (size_t beamnum = 0; beamnum < consts::NBEAMS; beamnum++) {
-		cout << "BEAMNUM is " << beamnum << endl;
+	for (int device = 0; device < device_count; device++) {
+		gpuErrchk(cudaSetDevice(device));
 
-		k0 = {
-			-1 * BEAM_NORM[beamnum][0],
-			-1 * BEAM_NORM[beamnum][1],
-			-1 * BEAM_NORM[beamnum][2]
-		};
-		for (size_t raynum = 0; raynum < consts::NRAYS; raynum++) {
-			// get ray start pos
-			Xyz<double>* ref_pos = &(ref_positions[raynum]);
-			Xyz<double> start_pos = *ref_pos;
-			// ensure circular beam with power cutoff
-			// TODO: is there a more efficient way to make a circular set of rays
-			// rather than just making a square and cutting off the edges?
-			double ref = sqrt(pow(start_pos.x, 2) + pow(start_pos.y, 2));
-			if (ref >= consts::BEAM_MAX_Z) continue;
+		gpuErrchk(cudaMalloc(cuda_mesh + device, sizeof(MeshPoint) * consts::GRID));
+		gpuErrchk(cudaMemcpy(cuda_mesh[device], mesh, sizeof(MeshPoint) * consts::GRID, cudaMemcpyHostToDevice));
+		gpuErrchk(cudaMalloc(cuda_deden + device, sizeof(Xyz<double>) * consts::GRID));
+		gpuErrchk(cudaMemcpy(cuda_deden[device], deden, sizeof(Xyz<double>) * consts::GRID, cudaMemcpyHostToDevice));
+		gpuErrchk(cudaMalloc(cuda_ref_positions + device, sizeof(Xyz<double>) * consts::NRAYS));
+		gpuErrchk(cudaMemcpy(cuda_ref_positions[device], ref_positions, sizeof(Xyz<double>) * consts::NRAYS, cudaMemcpyHostToDevice));
 
-			// C++ comment reads: "We will first rotate in XZ plane about the Y axis,
-			// so z -> z' will be complete. Then, we will rotate in the XY plane about
-			// the Z axis so x -> x' and y -> y' will be complete."
-			// first rotation
-			double theta1 = acos(BEAM_NORM[beamnum][2]);
-			start_pos.x = ref_pos->x*cos(theta1) + ref_pos->z*sin(theta1);
-			start_pos.z = ref_pos->z*cos(theta1) - ref_pos->x*sin(theta1);
-			// second rotation
-			double theta2 = atan2(BEAM_NORM[beamnum][1] * consts::FOCAL_LENGTH,
-				BEAM_NORM[beamnum][0] * consts::FOCAL_LENGTH);
-			double tmp_x0 = start_pos.x;
-			start_pos.x = start_pos.x*cos(theta2) - start_pos.y*sin(theta2);
-			start_pos.y = start_pos.y*cos(theta2) + tmp_x0*sin(theta2);
+		gpuErrchk(cudaMalloc(cuda_crossings + device, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
+		gpuErrchk(cudaMemset(cuda_crossings[device], 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
+		gpuErrchk(cudaMalloc(cuda_turn + device, sizeof(size_t) * consts::NRAYS * n_beams_in_memory));
+		gpuErrchk(cudaMemset(cuda_turn[device], 0, sizeof(size_t) * consts::NRAYS * n_beams_in_memory));
 
-			// launch child rays
-			constexpr double dist = 0.2 * consts::DX;
-			Xyz<double> delta1 = {-k0.y, -k0.x, 0};
-			double l1 = dist / mag(delta1);
-			delta1.x *= l1;
-			delta1.y *= l1;
-			Xyz<double> child_start_pos = {
-				start_pos.x + delta1.x,
-				start_pos.y + delta1.y,
-				start_pos.z + delta1.z
-			};
+		gpuErrchk(cudaMalloc(TEMPcuda_offsets + device, sizeof(double) * consts::NRAYS));
+		gpuErrchk(cudaMemcpy(TEMPcuda_offsets[device], TEMPoffsets, sizeof(double) * consts::NRAYS, cudaMemcpyHostToDevice));
 
-			size_t c1_size = launch_child_ray(mesh, deden,
-				child_start_pos, k0,
-				child1, dist1);
-			delta1 = {-k0.x * k0.z, -k0.y * k0.z, k0.x * k0.x + k0.y * k0.y};
-			l1 = dist / mag(delta1);
-			delta1.x *= l1;
-			delta1.y *= l1;
-			delta1.z *= l1;
-			child_start_pos = {
-				start_pos.x + delta1.x,
-				start_pos.y + delta1.y,
-				start_pos.z + delta1.z
-			};
-			size_t c2_size = launch_child_ray(mesh, deden,
-				child_start_pos, k0,
-				child2, dist2);
+		gpuErrchk(cudaMalloc(cuda_child + device, sizeof(Xyz<double>) * consts::NT * 2 * n_trajectories));
+		gpuErrchk(cudaMalloc(cuda_dist + device, sizeof(double) * consts::NT * 2 * n_trajectories));
+	}
 
-			// launch parent ray
-			Crossing* crossings_ind = crossings + (beamnum*consts::NRAYS + raynum)*consts::NCROSSINGS;
-			// NOTE: TEMPORARY: compute initial intensity
-			double TEMPoffset = sqrt(pow(TEMPoffsets[raynum / consts::NRAYS_X], 2) + pow(TEMPoffsets[raynum % consts::NRAYS_X], 2));
-			double TEMPinit_intensity = (consts::INTENSITY/1e14)*exp(-2*pow(abs(TEMPoffset/consts::SIGMA),4.0));
-			launch_parent_ray(mesh, deden,
-				child1, dist1, c1_size,
-				child2, dist2, c2_size,
-				start_pos, k0, crossings_ind, turn + beamnum*consts::NRAYS + raynum, TEMPinit_intensity);
+	auto time2 = std::chrono::high_resolution_clock::now();
+	printf("\tSetting up GPU memory and copying took %Lf seconds\n", (time2 - time1) / 1.0s);
+
+	// NOTE: ideally: launch two threads, and copying can be done independently!
+	// otherwise, right now, it assumes that ray tracing takes about the same amnt
+	// of time on both GPUs.
+	for (size_t batch = 0; batch < n_batches; batch += device_count) {
+		for (int device = 0; device < device_count; device++) {
+			if (batch + device >= n_batches) break;
+			gpuErrchk(cudaSetDevice(device));
+			for (size_t beamnum = 0; beamnum < n_beams_in_memory; beamnum++) {
+				trace_rays
+					<<<CEIL_DIV(consts::NRAYS / rays_per_thread, THREADS_PER_BLOCK), THREADS_PER_BLOCK>>>
+					(cuda_mesh[device], cuda_deden[device], cuda_child[device], cuda_dist[device],
+					 beamnum, beamnum + (batch + device) * n_beams_in_memory,
+					 cuda_ref_positions[device], TEMPcuda_offsets[device], cuda_crossings[device], cuda_turn[device], rays_per_thread);
+				gpuErrchk(cudaPeekAtLastError());
+			}
 		}
+		for (int device = 0; device < device_count; device++) {
+			if (batch + device >= n_batches) break;
+			gpuErrchk(cudaSetDevice(device));
+			gpuErrchk(cudaDeviceSynchronize());
+			gpuErrchk(cudaMemcpy(crossings + (batch + device) * n_beams_in_memory * consts::NCROSSINGS * consts::NRAYS, cuda_crossings[device],
+				sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory, cudaMemcpyDeviceToHost));
+			gpuErrchk(cudaMemset(cuda_crossings[device], 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
+			gpuErrchk(cudaMemcpy(turn + (batch + device) * n_beams_in_memory * consts::NRAYS, cuda_turn[device],
+				sizeof(size_t) * consts::NRAYS * n_beams_in_memory, cudaMemcpyDeviceToHost));
+		}
+	}
+
+	gpuErrchk(cudaDeviceSynchronize());
+
+	for (int device = 0; device < device_count; device++) {
+		gpuErrchk(cudaSetDevice(device));
+		gpuErrchk(cudaFree(cuda_mesh[device]));
+		gpuErrchk(cudaFree(cuda_crossings[device]));
+		gpuErrchk(cudaFree(cuda_deden[device]));
+		gpuErrchk(cudaFree(cuda_ref_positions[device]));
+		gpuErrchk(cudaFree(cuda_turn[device]));
+		gpuErrchk(cudaFree(cuda_child[device]));
+		gpuErrchk(cudaFree(cuda_dist[device]));
+		gpuErrchk(cudaFree(TEMPcuda_offsets[device]));
 	}
 
 	delete[] TEMPoffsets;
 	delete[] deden;
 	delete[] ref_positions;
-	delete[] child1;
-	delete[] dist1;
-	delete[] child2;
-	delete[] dist2;
+
+	delete[] cuda_mesh;
+	delete[] cuda_crossings;
+	delete[] cuda_deden;
+	delete[] cuda_ref_positions;
+	delete[] cuda_turn;
+	delete[] cuda_child;
+	delete[] cuda_dist;
+	delete[] TEMPcuda_offsets;
+
+	time1 = std::chrono::high_resolution_clock::now();
+	printf("\tRay tracing + copying took %Lf seconds\n", (time1 - time2) / 1.0s);
+	printf("\tTotal time: %Lf seconds\n", (time1 - start_time) / 1.0s);
 }
 
-size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
+__global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,
+		Xyz<double>* child, double* dist,
+		size_t b_mem_num, size_t beamnum, Xyz<double>* ref_positions, double* TEMPoffsets,
+		Crossing* crossings, size_t* turn, size_t rays_per_thread) {
+	size_t thread_num = blockIdx.x*THREADS_PER_BLOCK + threadIdx.x;
+	// is this okay? will the compiler optimize this? let's hope...
+	size_t max_raynum = min(consts::NRAYS, (thread_num+1) * rays_per_thread);
+	Xyz<double> k0 = {
+		-1 * BEAM_NORM[beamnum][0],
+		-1 * BEAM_NORM[beamnum][1],
+		-1 * BEAM_NORM[beamnum][2]
+	};
+	Xyz<double>* child1 = child + (consts::NT * thread_num * 2);
+	Xyz<double>* child2 = child1 + consts::NT;
+	double* dist1 = dist + (consts::NT * thread_num * 2);
+	double* dist2 = dist1 + consts::NT;
+	for (size_t raynum = thread_num * rays_per_thread; raynum < max_raynum; raynum++) {
+		// get ray start pos
+		Xyz<double>* ref_pos = &(ref_positions[raynum]);
+		Xyz<double> start_pos = *ref_pos;
+		// ensure circular beam with power cutoff
+		// TODO: FIGURE OUT SOMETHING BETTER THAN THIS
+		// BECAUSE OF CUDA!!!!!!!
+		double ref = sqrt(pow(start_pos.x, 2) + pow(start_pos.y, 2));
+		if (ref >= consts::BEAM_MAX_Z) continue;
+
+		// C++ comment reads: "We will first rotate in XZ plane about the Y axis,
+		// so z -> z' will be complete. Then, we will rotate in the XY plane about
+		// the Z axis so x -> x' and y -> y' will be complete."
+		// first rotation
+		double theta1 = acos(BEAM_NORM[beamnum][2]);
+		start_pos.x = ref_pos->x*cos(theta1) + ref_pos->z*sin(theta1);
+		start_pos.z = ref_pos->z*cos(theta1) - ref_pos->x*sin(theta1);
+		// second rotation
+		double theta2 = atan2(BEAM_NORM[beamnum][1] * consts::FOCAL_LENGTH,
+			BEAM_NORM[beamnum][0] * consts::FOCAL_LENGTH);
+		double tmp_x0 = start_pos.x;
+		start_pos.x = start_pos.x*cos(theta2) - start_pos.y*sin(theta2);
+		start_pos.y = start_pos.y*cos(theta2) + tmp_x0*sin(theta2);
+
+		// launch child rays
+		constexpr double dist = 0.2 * consts::DX;
+		Xyz<double> delta1 = {-k0.y, -k0.x, 0};
+		double l1 = dist / mag(delta1);
+		delta1.x *= l1;
+		delta1.y *= l1;
+		Xyz<double> child_start_pos = {
+			start_pos.x + delta1.x,
+			start_pos.y + delta1.y,
+			start_pos.z + delta1.z
+		};
+
+		size_t c1_size = launch_child_ray(mesh, deden,
+			child_start_pos, k0,
+			child1, dist1);
+		delta1 = {-k0.x * k0.z, -k0.y * k0.z, k0.x * k0.x + k0.y * k0.y};
+		l1 = dist / mag(delta1);
+		delta1.x *= l1;
+		delta1.y *= l1;
+		delta1.z *= l1;
+		child_start_pos = {
+			start_pos.x + delta1.x,
+			start_pos.y + delta1.y,
+			start_pos.z + delta1.z
+		};
+		size_t c2_size = launch_child_ray(mesh, deden,
+			child_start_pos, k0,
+			child2, dist2);
+
+		// launch parent ray
+		Crossing* crossings_ind = crossings + (b_mem_num*consts::NRAYS + raynum)*consts::NCROSSINGS;
+		// NOTE: TEMPORARY: compute initial intensity
+		double TEMPoffset = sqrt(pow(TEMPoffsets[raynum / consts::NRAYS_X], 2) + pow(TEMPoffsets[raynum % consts::NRAYS_X], 2));
+		double TEMPinit_intensity = (consts::INTENSITY/1e14)*exp(-2*pow(abs(TEMPoffset/consts::SIGMA),4.0));
+		launch_parent_ray(mesh, deden,
+			child1, dist1, c1_size,
+			child2, dist2, c2_size,
+			start_pos, k0, crossings_ind, turn + b_mem_num*consts::NRAYS + raynum, TEMPinit_intensity);
+	}
+}
+
+__device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 		Xyz<double>* child1, double* dist1, size_t c1_size,
 		Xyz<double>* child2, double* dist2, size_t c2_size,
 		Xyz<double> pos, Xyz<double> k0, Crossing* crossings, size_t* turn, double TEMPintensity) {
@@ -186,7 +330,8 @@ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 	double curr_dist = 0.0;
 	double kds = 0.0;
 	//double phase = 0.0;
-	double permittivity = fmax(1 - get_pt(mesh, mesh_pos)->eden / consts::NCRIT, 0.0);
+	double permittivity = 1 - get_pt(mesh, mesh_pos)->eden / consts::NCRIT;
+	if (permittivity < 0) permittivity = 0;
 
 	for (size_t _ = 1; _ < consts::NT; _++) {
 		// Update velocity and position
@@ -234,7 +379,8 @@ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 		mesh_pos = get_mesh_coords(mesh, pos);
 
 		double prev_permittivity = permittivity;
-		permittivity = fmax(1 - get_pt(mesh, mesh_pos)->eden / consts::NCRIT, 0);
+		permittivity = 1 - get_pt(mesh, mesh_pos)->eden / consts::NCRIT;
+		if (permittivity < 0.0) permittivity = 0.0;
 
 		double c_perms[3];
 		double c_distances[3]; // to sort by
@@ -406,7 +552,7 @@ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 	return cnum;
 }
 
-void calc_dk(Crossing* cross, Crossing* cross_next) {
+__device__ void calc_dk(Crossing* cross, Crossing* cross_next) {
 	Xyz<double> dk = {
 		cross_next->pt.x - cross->pt.x,
 		cross_next->pt.y - cross->pt.y,
@@ -418,7 +564,7 @@ void calc_dk(Crossing* cross, Crossing* cross_next) {
 }
 
 // returns the length of the trajectory reached
-size_t launch_child_ray(MeshPoint* mesh, Xyz<double>* deden,
+__device__ size_t launch_child_ray(MeshPoint* mesh, Xyz<double>* deden,
 		Xyz<double> start_pos, Xyz<double> k0,
 		Xyz<double>* traj, double* dist) {
 	size_t ind = 0;
@@ -426,7 +572,7 @@ size_t launch_child_ray(MeshPoint* mesh, Xyz<double>* deden,
 	dist[ind] = 0.0;
 	traj[0] = start_pos;
 	ind++;
-
+	
 	Xyz<size_t> mesh_pos = get_mesh_coords(mesh, traj[0]);
 
 	double k = get_k(mesh, traj[0], mesh_pos);
@@ -493,7 +639,7 @@ size_t launch_child_ray(MeshPoint* mesh, Xyz<double>* deden,
 	return ind;
 }
 
-double get_k(MeshPoint* mesh, Xyz<double> pos, Xyz<size_t> mesh_pos) {
+__device__ double get_k(MeshPoint* mesh, Xyz<double> pos, Xyz<size_t> mesh_pos) {
 	double interpolated_eden = interp3D(
 		pos, mesh_pos,
 		[&] (size_t x, size_t y, size_t z) -> double {
@@ -503,4 +649,59 @@ double get_k(MeshPoint* mesh, Xyz<double> pos, Xyz<size_t> mesh_pos) {
 
 	double wpe_interp = sqrt(interpolated_eden * 1e6 * pow(consts::EC, 2) / (consts::ME * consts::E0));
 	return sqrt((pow(consts::OMEGA, 2) - pow(wpe_interp, 2)) / pow(consts::C_SPEED, 2));
+}
+
+// used for interpolating child distance
+__device__ Xyz<double> interp_xyz(Xyz<double>* points, double* dist, size_t len, double xp) {
+	size_t low, high, mid;
+	if (dist[0] <= dist[len-1]) {
+		// x monotonically increase
+		if (xp <= dist[0]) {
+			return points[0];
+		} else if (xp >= dist[len-1]) {
+			return points[len-1];
+		}
+
+		low = 0;
+		high = len - 1;
+		mid = (low + high) >> 1;
+		while (low < high - 1) {
+			if (dist[mid] >= xp) {
+				high = mid;
+			} else {
+				low = mid;
+			}
+			mid = (low + high) >> 1;
+		}
+
+		assert((xp >= dist[mid]) && (xp <= dist[mid+1]));
+	} else {
+		if (xp >= dist[0]) {
+			return points[0];
+		} else if (xp <= dist[len-1]) {
+			return points[len-1];
+		}
+
+		low = 0;
+		high = len - 1;
+		mid = (low + high) >> 1;
+		while (low < high - 1) {
+			if (dist[mid] <= xp) {
+				low = mid;
+			} else {
+				high = mid;
+			}
+			mid = (low + high) >> 1;
+		}
+
+		assert((xp <= dist[mid]) && (xp >= dist[mid+1]));
+	}
+	return {
+		points[mid].x +
+			((points[mid+1].x - points[mid].x)/(dist[mid+1]-dist[mid])*(xp-dist[mid])),
+		points[mid].y +
+			((points[mid+1].y - points[mid].y)/(dist[mid+1]-dist[mid])*(xp-dist[mid])),
+		points[mid].z +
+			((points[mid+1].z - points[mid].z)/(dist[mid+1]-dist[mid])*(xp-dist[mid]))
+	};
 }
