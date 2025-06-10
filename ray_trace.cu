@@ -23,7 +23,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 using namespace std::literals; // for dividing times by 1.0s
 
-void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
+void ray_trace(MeshPoint* mesh, RayTraceResult* result) {
 	auto start_time = std::chrono::high_resolution_clock::now();
 	// calculate dedens (derivative of eden wrt. x, y z)
 	Xyz<double>* deden = new Xyz<double>[consts::GRID];
@@ -109,19 +109,11 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	}
 	printf("\tUsing %lu batch(es), %lu beams per batch\n", n_batches, n_beams_in_memory);
 
-	// fill remaining memory with trajectories
-	size_t n_trajectories = gpu_bytes_free / ((sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT);
-	if (n_trajectories > consts::NRAYS) n_trajectories = consts::NRAYS;
-	size_t rays_per_thread = consts::NRAYS / n_trajectories;
-	printf("\tUsing %lu ray(s) per thread\n", rays_per_thread);
-
 	MeshPoint** cuda_mesh = new MeshPoint*[device_count];
 	Crossing** cuda_crossings = new Crossing*[device_count];
 	Xyz<double>** cuda_deden = new Xyz<double>*[device_count];
 	Xyz<double>** cuda_ref_positions = new Xyz<double>*[device_count];
 	size_t** cuda_turn = new size_t*[device_count];
-	Xyz<double>** cuda_child = new Xyz<double>*[device_count];
-	double** cuda_dist = new double*[device_count];
 
 	// NOTE: TEMPORARY: intensity offsets
 	double* TEMPoffsets = new double[consts::NRAYS];
@@ -149,12 +141,39 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		gpuErrchk(cudaMalloc(TEMPcuda_offsets + device, sizeof(double) * consts::NRAYS));
 		gpuErrchk(cudaMemcpy(TEMPcuda_offsets[device], TEMPoffsets, sizeof(double) * consts::NRAYS, cudaMemcpyHostToDevice));
 
+		gpuErrchk(cudaMemGetInfo(&real_gpu_bytes_free, NULL));
+		gpu_bytes_free = min(gpu_bytes_free, real_gpu_bytes_free);
+	}
+	
+	// fill the rest of the memory with child trajectories
+	Xyz<double>** cuda_child = new Xyz<double>*[device_count];
+	double** cuda_dist = new double*[device_count];
+
+	size_t n_trajectories = gpu_bytes_free / ((sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT);
+	if (n_trajectories > consts::NRAYS) n_trajectories = consts::NRAYS;
+	size_t rays_per_thread = CEIL_DIV(consts::NRAYS, n_trajectories);
+	n_trajectories = CEIL_DIV(consts::NRAYS, rays_per_thread);
+	// leave 1mb on gpu (i just chose a random number that sounds right)
+	// (if things break make it bigger I guess)
+	if (gpu_bytes_free - n_trajectories * (sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT < 1000000) {
+		n_trajectories--;
+		rays_per_thread = CEIL_DIV(consts::NRAYS, n_trajectories);
+		n_trajectories = CEIL_DIV(consts::NRAYS, rays_per_thread);
+	}
+	printf("\tUsing %lu ray(s) per thread\n", rays_per_thread);
+
+	for (int device = 0; device < device_count; device++) {
+		gpuErrchk(cudaSetDevice(device));
 		gpuErrchk(cudaMalloc(cuda_child + device, sizeof(Xyz<double>) * consts::NT * 2 * n_trajectories));
 		gpuErrchk(cudaMalloc(cuda_dist + device, sizeof(double) * consts::NT * 2 * n_trajectories));
 	}
 
 	auto time2 = std::chrono::high_resolution_clock::now();
 	printf("\tSetting up GPU memory and copying took %Lf seconds\n", (time2 - time1) / 1.0s);
+
+	// allocate results
+	Crossing** crossings = new Crossing*[n_batches];
+	size_t** turn = new size_t*[n_batches];
 
 	// NOTE: ideally: launch two threads, and copying can be done independently!
 	// otherwise, right now, it assumes that ray tracing takes about the same amnt
@@ -164,10 +183,12 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 			if (batch + device >= n_batches) break;
 			gpuErrchk(cudaSetDevice(device));
 			for (size_t beamnum = 0; beamnum < n_beams_in_memory; beamnum++) {
+				size_t real_beamnum = beamnum + (batch + device) * n_beams_in_memory;
+				if (real_beamnum >= consts::NBEAMS) break;
 				trace_rays
 					<<<CEIL_DIV(consts::NRAYS / rays_per_thread, THREADS_PER_BLOCK), THREADS_PER_BLOCK>>>
 					(cuda_mesh[device], cuda_deden[device], cuda_child[device], cuda_dist[device],
-					 beamnum, beamnum + (batch + device) * n_beams_in_memory,
+					 beamnum, real_beamnum,
 					 cuda_ref_positions[device], TEMPcuda_offsets[device], cuda_crossings[device], cuda_turn[device], rays_per_thread);
 				gpuErrchk(cudaPeekAtLastError());
 			}
@@ -176,11 +197,17 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 			if (batch + device >= n_batches) break;
 			gpuErrchk(cudaSetDevice(device));
 			gpuErrchk(cudaDeviceSynchronize());
-			gpuErrchk(cudaMemcpy(crossings + (batch + device) * n_beams_in_memory * consts::NCROSSINGS * consts::NRAYS, cuda_crossings[device],
+
+			// allocate results
+			crossings[batch + device] = new Crossing[n_beams_in_memory * consts::NRAYS * consts::NCROSSINGS];
+			turn[batch + device] = new size_t[n_beams_in_memory * consts::NRAYS];
+
+			gpuErrchk(cudaMemcpy(crossings[batch + device], cuda_crossings[device],
 				sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory, cudaMemcpyDeviceToHost));
 			gpuErrchk(cudaMemset(cuda_crossings[device], 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
-			gpuErrchk(cudaMemcpy(turn + (batch + device) * n_beams_in_memory * consts::NRAYS, cuda_turn[device],
+			gpuErrchk(cudaMemcpy(turn[batch + device], cuda_turn[device],
 				sizeof(size_t) * consts::NRAYS * n_beams_in_memory, cudaMemcpyDeviceToHost));
+			printf("\t\tDone batch %lu\n", batch + device + 1);
 		}
 	}
 
@@ -214,6 +241,20 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	time1 = std::chrono::high_resolution_clock::now();
 	printf("\tRay tracing + copying took %Lf seconds\n", (time1 - time2) / 1.0s);
 	printf("\tTotal time: %Lf seconds\n", (time1 - start_time) / 1.0s);
+
+	result->crossings = crossings;
+	result->turn = turn;
+	result->n_batches = n_batches;
+	result->n_beams_per_batch = n_beams_in_memory;
+}
+
+void free_rt_result(RayTraceResult* result) {
+	for (size_t i = 0; i < result->n_batches; i++) {
+		delete[] result->crossings[i];
+		delete[] result->turn[i];
+	}
+	delete[] result->crossings;
+	delete[] result->turn;
 }
 
 __global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,

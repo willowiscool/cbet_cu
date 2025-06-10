@@ -96,7 +96,7 @@ MeshPoint* read_spherical_mesh() {
 
 // Writes the following datasets to edep.hdf5:
 // /wplot, /absorption, /Coordinate_x, /Coordinate_y, /Coordinate_z
-void save_hdf5(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
+void save_hdf5(MeshPoint* mesh, RayTraceResult* rt_result) {
 	H5::H5File file("edep.hdf5", H5F_ACC_TRUNC);
 	H5::IntType datatype(H5::PredType::NATIVE_DOUBLE);
 	datatype.setOrder(H5T_ORDER_LE);
@@ -112,27 +112,30 @@ void save_hdf5(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	double* sheet2 = new double[consts::GRID];
 	int* count1 = new int[consts::GRID];
 	int* count2 = new int[consts::GRID];
-	for (size_t beamnum = 0; beamnum < consts::NBEAMS; beamnum++) {
-		fill_n(count1, consts::GRID, 0);
-		fill_n(sheet1, consts::GRID, 0.0);
-		fill_n(count2, consts::GRID, 0);
-		fill_n(sheet2, consts::GRID, 0.0);
-		for (size_t raynum = 0; raynum < consts::NRAYS; raynum++) {
-			for (size_t cnum = 0; cnum < consts::NCROSSINGS; cnum++) {
-				// figure out some way to break? or, don't care about it.
-				Crossing* cross = crossings + (beamnum*consts::NRAYS + raynum)*consts::NCROSSINGS + cnum;
-				if (cnum < turn[beamnum * consts::NRAYS + raynum]) {
-					*(get_pt(sheet1, cross->boxes)) += cross->i_b;
-					*(get_pt(count1, cross->boxes)) += 1;
-				} else {
-					*(get_pt(sheet2, cross->boxes)) += cross->i_b;
-					*(get_pt(count2, cross->boxes)) += 1;
+	for (size_t batch = 0; batch < rt_result->n_batches; batch++) {
+		for (size_t beamnum = 0; beamnum < rt_result->n_beams_per_batch; beamnum++) {
+			if (beamnum + (batch * rt_result->n_beams_per_batch) > consts::NBEAMS) break;
+			fill_n(count1, consts::GRID, 0);
+			fill_n(sheet1, consts::GRID, 0.0);
+			fill_n(count2, consts::GRID, 0);
+			fill_n(sheet2, consts::GRID, 0.0);
+			for (size_t raynum = 0; raynum < consts::NRAYS; raynum++) {
+				for (size_t cnum = 0; cnum < consts::NCROSSINGS; cnum++) {
+					// figure out some way to break? or, don't care about it.
+					Crossing* cross = rt_result->crossings[batch] + (beamnum*consts::NRAYS + raynum)*consts::NCROSSINGS + cnum;
+					if (cnum < rt_result->turn[batch][beamnum * consts::NRAYS + raynum]) {
+						*(get_pt(sheet1, cross->boxes)) += cross->i_b;
+						*(get_pt(count1, cross->boxes)) += 1;
+					} else {
+						*(get_pt(sheet2, cross->boxes)) += cross->i_b;
+						*(get_pt(count2, cross->boxes)) += 1;
+					}
 				}
 			}
-		}
-		for (size_t i = 0; i < consts::GRID; i++) {
-			if (count1[i] > 0) wplot[i] += pow(sheet1[i] / count1[i], 2);
-			if (count2[i] > 0) wplot[i] += pow(sheet2[i] / count2[i], 2);
+			for (size_t i = 0; i < consts::GRID; i++) {
+				if (count1[i] > 0) wplot[i] += pow(sheet1[i] / count1[i], 2);
+				if (count2[i] > 0) wplot[i] += pow(sheet2[i] / count2[i], 2);
+			}
 		}
 	}
 	for (size_t i = 0; i < consts::GRID; i++) wplot[i] = sqrt(wplot[i]);
@@ -165,17 +168,16 @@ int main() {
 	printf("Reading mesh\n");
 	MeshPoint* mesh = read_spherical_mesh();
 
-	printf("Allocating beam info on CPU\n");
-	Crossing* crossings = new Crossing[consts::NBEAMS * consts::NRAYS * consts::NCROSSINGS]();
-	size_t* turn = new size_t[consts::NBEAMS * consts::NRAYS];
 	printf("Starting ray tracing\n");
-	ray_trace(mesh, crossings, turn);
+	RayTraceResult rt_result;
+	ray_trace(mesh, &rt_result);
+
+	printf("Got %lu batches with %lu beams per batch\n", rt_result.n_batches, rt_result.n_beams_per_batch);
 	
 	printf("Writing hdf5 file\n");
-	save_hdf5(mesh, crossings, turn);
+	save_hdf5(mesh, &rt_result);
 
-	delete[] crossings;
-	delete[] turn;
+	free_rt_result(&rt_result);
 	delete[] mesh;
 	return 0;
 }
