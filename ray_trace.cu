@@ -2,6 +2,8 @@
 #include <iostream>
 #include <cassert>
 #include <chrono>
+#include <vector>
+#include <numeric>
 #include <omp.h>
 #include "ray_trace.cuh"
 #include "ray_trace.hpp"
@@ -73,6 +75,9 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	}
 
 	// See how much memory we need
+	// TODO: update to enumerate GPUs, find the one with more memory? or less
+	// memory? or, maybe, have the user provide a GPU profile to use, so the
+	// code doesn't have to guess how they want to use their GPUs...?
 	size_t real_gpu_bytes_free;
 	gpuErrchk(cudaMemGetInfo(&real_gpu_bytes_free, NULL));
 	// take out mesh size + ref positions and stuff
@@ -86,8 +91,21 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	// make sure to use all available GPUs
 	int device_count;
 	gpuErrchk(cudaGetDeviceCount(&device_count));
-	n_batches = max((int)n_batches, device_count);
 
+	// enumerate devices, hacky way of making sure
+	// that the one non-A100 GPU on darkworld isn't used....?
+	std::vector<int> device_ids(device_count);
+	std::iota(device_ids.begin(), device_ids.end(), 0);
+	for (size_t i = 0; i < device_ids.size(); i++) {
+		cudaDeviceProp device_prop;
+		cudaGetDeviceProperties(&device_prop, device_ids[i]);
+		if (device_prop.totalGlobalMem < gpu_bytes_free) {
+			device_ids.erase(device_ids.begin()+i);
+			i--;
+		}
+	}
+	device_count = device_ids.size();
+	n_batches = max((int)n_batches, device_count);
 	n_beams_in_memory = CEIL_DIV(consts::NBEAMS, n_batches);
 
 	printf("\t%d GPU(s)\n", device_count);
@@ -105,7 +123,8 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	#pragma omp parallel
 	{
 		int device = omp_get_thread_num();
-		gpuErrchk(cudaSetDevice(device));
+		int device_id = device_ids[device];
+		gpuErrchk(cudaSetDevice(device_id));
 
 		MeshPoint* cuda_mesh;
 		Crossing* cuda_crossings;
