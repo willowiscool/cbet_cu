@@ -2,6 +2,7 @@
 #include <iostream>
 #include <cassert>
 #include <chrono>
+#include <omp.h>
 #include "ray_trace.cuh"
 #include "ray_trace.hpp"
 #include "consts.hpp"
@@ -71,9 +72,6 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		}
 	}
 
-	auto time1 = std::chrono::high_resolution_clock::now();
-	printf("\tSetting up arrays took %Lf seconds\n", (time1-start_time)/1.0s);
-
 	// See how much memory we need
 	size_t real_gpu_bytes_free;
 	gpuErrchk(cudaMemGetInfo(&real_gpu_bytes_free, NULL));
@@ -84,36 +82,16 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		(sizeof(Xyz<double>) + sizeof(double)) * consts::NRAYS);
 	size_t n_beams_in_memory = gpu_bytes_free / ((sizeof(Crossing) * consts::NCROSSINGS + sizeof(size_t)) * consts::NRAYS);
 	size_t n_batches = CEIL_DIV(consts::NBEAMS, n_beams_in_memory);
+
+	// make sure to use all available GPUs
+	int device_count;
+	gpuErrchk(cudaGetDeviceCount(&device_count));
+	n_batches = max((int)n_batches, device_count);
+
 	n_beams_in_memory = CEIL_DIV(consts::NBEAMS, n_batches);
 
-	int device_count = 1;
-	if (n_batches > 1) {
-		gpuErrchk(cudaGetDeviceCount(&device_count));
-		device_count = min(device_count, (int)n_batches);
-		printf("\tUsing %d GPUs\n", device_count);
-		// adjust gpu memory free to fit smallest GPU
-		// NOTE: this code assumes GPUs have roughly the same memory size/free memory
-		// and this is just insurance in case one GPU is slightly less free
-		// but if one GPU is significantly smaller, THIS WHOLE THING NEEDS TO BE CHANGED!!
-		if (device_count > 1) {
-			for (int device = 0; device < device_count; device++) {
-				gpuErrchk(cudaSetDevice(device));
-				size_t this_gpu_bytes_free;
-				gpuErrchk(cudaMemGetInfo(&this_gpu_bytes_free, NULL));
-				if (this_gpu_bytes_free < real_gpu_bytes_free) {
-					gpu_bytes_free -= (real_gpu_bytes_free - this_gpu_bytes_free);
-					real_gpu_bytes_free = this_gpu_bytes_free;
-				}
-			}
-		}
-	}
-	printf("\tUsing %lu batch(es), %lu beams per batch\n", n_batches, n_beams_in_memory);
-
-	MeshPoint** cuda_mesh = new MeshPoint*[device_count];
-	Crossing** cuda_crossings = new Crossing*[device_count];
-	Xyz<double>** cuda_deden = new Xyz<double>*[device_count];
-	Xyz<double>** cuda_ref_positions = new Xyz<double>*[device_count];
-	size_t** cuda_turn = new size_t*[device_count];
+	printf("\t%d GPU(s)\n", device_count);
+	printf("\t%lu batch(es), %lu beams per batch\n", n_batches, n_beams_in_memory);
 
 	// NOTE: TEMPORARY: intensity offsets
 	double* TEMPoffsets = new double[consts::NRAYS];
@@ -121,114 +99,91 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	for (size_t i = 0; i < consts::NRAYS; i++) {
 		TEMPoffsets[i] = consts::BEAM_MIN_Z + i * TEMPdx;
 	}
-	double** TEMPcuda_offsets = new double*[device_count];
 
-	for (int device = 0; device < device_count; device++) {
+	omp_set_num_threads(device_count);
+
+	#pragma omp parallel
+	{
+		int device = omp_get_thread_num();
 		gpuErrchk(cudaSetDevice(device));
 
-		gpuErrchk(cudaMalloc(cuda_mesh + device, sizeof(MeshPoint) * consts::GRID));
-		gpuErrchk(cudaMemcpy(cuda_mesh[device], mesh, sizeof(MeshPoint) * consts::GRID, cudaMemcpyHostToDevice));
-		gpuErrchk(cudaMalloc(cuda_deden + device, sizeof(Xyz<double>) * consts::GRID));
-		gpuErrchk(cudaMemcpy(cuda_deden[device], deden, sizeof(Xyz<double>) * consts::GRID, cudaMemcpyHostToDevice));
-		gpuErrchk(cudaMalloc(cuda_ref_positions + device, sizeof(Xyz<double>) * consts::NRAYS));
-		gpuErrchk(cudaMemcpy(cuda_ref_positions[device], ref_positions, sizeof(Xyz<double>) * consts::NRAYS, cudaMemcpyHostToDevice));
+		MeshPoint* cuda_mesh;
+		Crossing* cuda_crossings;
+		Xyz<double>* cuda_deden;
+		Xyz<double>* cuda_ref_positions;
+		size_t* cuda_turn;
+		Xyz<double>* cuda_child;
+		double* cuda_dist;
+		double* TEMPcuda_offsets;
 
-		gpuErrchk(cudaMalloc(cuda_crossings + device, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
-		gpuErrchk(cudaMemset(cuda_crossings[device], 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
-		gpuErrchk(cudaMalloc(cuda_turn + device, sizeof(size_t) * consts::NRAYS * n_beams_in_memory));
-		gpuErrchk(cudaMemset(cuda_turn[device], 0, sizeof(size_t) * consts::NRAYS * n_beams_in_memory));
+		gpuErrchk(cudaMalloc(&cuda_mesh, sizeof(MeshPoint) * consts::GRID));
+		gpuErrchk(cudaMemcpy(cuda_mesh, mesh, sizeof(MeshPoint) * consts::GRID, cudaMemcpyHostToDevice));
+		gpuErrchk(cudaMalloc(&cuda_deden, sizeof(Xyz<double>) * consts::GRID));
+		gpuErrchk(cudaMemcpy(cuda_deden, deden, sizeof(Xyz<double>) * consts::GRID, cudaMemcpyHostToDevice));
+		gpuErrchk(cudaMalloc(&cuda_ref_positions, sizeof(Xyz<double>) * consts::NRAYS));
+		gpuErrchk(cudaMemcpy(cuda_ref_positions, ref_positions, sizeof(Xyz<double>) * consts::NRAYS, cudaMemcpyHostToDevice));
 
-		gpuErrchk(cudaMalloc(TEMPcuda_offsets + device, sizeof(double) * consts::NRAYS));
-		gpuErrchk(cudaMemcpy(TEMPcuda_offsets[device], TEMPoffsets, sizeof(double) * consts::NRAYS, cudaMemcpyHostToDevice));
+		gpuErrchk(cudaMalloc(&cuda_crossings, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
+		gpuErrchk(cudaMemset(cuda_crossings, 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
+		gpuErrchk(cudaMalloc(&cuda_turn, sizeof(size_t) * consts::NRAYS * n_beams_in_memory));
+		gpuErrchk(cudaMemset(cuda_turn, 0, sizeof(size_t) * consts::NRAYS * n_beams_in_memory));
 
-		gpuErrchk(cudaMemGetInfo(&real_gpu_bytes_free, NULL));
-		gpu_bytes_free = min(gpu_bytes_free, real_gpu_bytes_free);
-	}
-	
-	// fill the rest of the memory with child trajectories
-	Xyz<double>** cuda_child = new Xyz<double>*[device_count];
-	double** cuda_dist = new double*[device_count];
+		gpuErrchk(cudaMalloc(&TEMPcuda_offsets, sizeof(double) * consts::NRAYS));
+		gpuErrchk(cudaMemcpy(TEMPcuda_offsets, TEMPoffsets, sizeof(double) * consts::NRAYS, cudaMemcpyHostToDevice));
 
-	size_t n_trajectories = gpu_bytes_free / ((sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT);
-	if (n_trajectories > consts::NRAYS) n_trajectories = consts::NRAYS;
-	size_t rays_per_thread = CEIL_DIV(consts::NRAYS, n_trajectories);
-	n_trajectories = CEIL_DIV(consts::NRAYS, rays_per_thread);
-	// leave 1mb on gpu (i just chose a random number that sounds right)
-	// (if things break make it bigger I guess)
-	if (gpu_bytes_free - n_trajectories * (sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT < 1000000) {
-		n_trajectories--;
-		rays_per_thread = CEIL_DIV(consts::NRAYS, n_trajectories);
+		// fill the rest of the memory with trajectories
+		size_t gpu_bytes_free; // local version
+		gpuErrchk(cudaMemGetInfo(&gpu_bytes_free, NULL));
+		size_t n_trajectories = gpu_bytes_free / ((sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT);
+		if (n_trajectories > consts::NRAYS) n_trajectories = consts::NRAYS;
+		size_t rays_per_thread = CEIL_DIV(consts::NRAYS, n_trajectories);
 		n_trajectories = CEIL_DIV(consts::NRAYS, rays_per_thread);
-	}
-	printf("\tUsing %lu ray(s) per thread\n", rays_per_thread);
+		// leave 1mb on gpu (i just chose a random number that sounds right)
+		// (if things break make it bigger I guess)
+		if (gpu_bytes_free - n_trajectories * (sizeof(Xyz<double>) + sizeof(double)) * 2 * consts::NT < 1000000) {
+			n_trajectories--;
+			rays_per_thread = CEIL_DIV(consts::NRAYS, n_trajectories);
+			n_trajectories = CEIL_DIV(consts::NRAYS, rays_per_thread);
+		}
+		printf("\t%lu ray(s) per thread on GPU %d\n", rays_per_thread, device);
 
-	for (int device = 0; device < device_count; device++) {
-		gpuErrchk(cudaSetDevice(device));
-		gpuErrchk(cudaMalloc(cuda_child + device, sizeof(Xyz<double>) * consts::NT * 2 * n_trajectories));
-		gpuErrchk(cudaMalloc(cuda_dist + device, sizeof(double) * consts::NT * 2 * n_trajectories));
-	}
+		gpuErrchk(cudaMalloc(&cuda_child, sizeof(Xyz<double>) * consts::NT * 2 * n_trajectories));
+		gpuErrchk(cudaMalloc(&cuda_dist, sizeof(double) * consts::NT * 2 * n_trajectories));
 
-	auto time2 = std::chrono::high_resolution_clock::now();
-	printf("\tSetting up GPU memory and copying took %Lf seconds\n", (time2 - time1) / 1.0s);
-
-	// NOTE: ideally: launch two threads, and copying can be done independently!
-	// otherwise, right now, it assumes that ray tracing takes about the same amnt
-	// of time on both GPUs.
-	for (size_t batch = 0; batch < n_batches; batch += device_count) {
-		for (int device = 0; device < device_count; device++) {
+		for (size_t batch = 0; batch < n_batches; batch += device_count) {
 			if (batch + device >= n_batches) break;
-			gpuErrchk(cudaSetDevice(device));
 			for (size_t beamnum = 0; beamnum < n_beams_in_memory; beamnum++) {
 				trace_rays
 					<<<CEIL_DIV(consts::NRAYS / rays_per_thread, THREADS_PER_BLOCK), THREADS_PER_BLOCK>>>
-					(cuda_mesh[device], cuda_deden[device], cuda_child[device], cuda_dist[device],
+					(cuda_mesh, cuda_deden, cuda_child, cuda_dist,
 					 beamnum, beamnum + (batch + device) * n_beams_in_memory,
-					 cuda_ref_positions[device], TEMPcuda_offsets[device], cuda_crossings[device], cuda_turn[device], rays_per_thread);
+					 cuda_ref_positions, TEMPcuda_offsets, cuda_crossings, cuda_turn, rays_per_thread);
 				gpuErrchk(cudaPeekAtLastError());
 			}
-		}
-		for (int device = 0; device < device_count; device++) {
-			if (batch + device >= n_batches) break;
-			gpuErrchk(cudaSetDevice(device));
 			gpuErrchk(cudaDeviceSynchronize());
-			gpuErrchk(cudaMemcpy(crossings + (batch + device) * n_beams_in_memory * consts::NCROSSINGS * consts::NRAYS, cuda_crossings[device],
+			gpuErrchk(cudaMemcpy(crossings + (batch + device) * n_beams_in_memory * consts::NCROSSINGS * consts::NRAYS, cuda_crossings,
 				sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory, cudaMemcpyDeviceToHost));
-			gpuErrchk(cudaMemset(cuda_crossings[device], 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
-			gpuErrchk(cudaMemcpy(turn + (batch + device) * n_beams_in_memory * consts::NRAYS, cuda_turn[device],
+			gpuErrchk(cudaMemset(cuda_crossings, 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
+			gpuErrchk(cudaMemcpy(turn + (batch + device) * n_beams_in_memory * consts::NRAYS, cuda_turn,
 				sizeof(size_t) * consts::NRAYS * n_beams_in_memory, cudaMemcpyDeviceToHost));
 		}
-	}
 
-	gpuErrchk(cudaDeviceSynchronize());
-
-	for (int device = 0; device < device_count; device++) {
-		gpuErrchk(cudaSetDevice(device));
-		gpuErrchk(cudaFree(cuda_mesh[device]));
-		gpuErrchk(cudaFree(cuda_crossings[device]));
-		gpuErrchk(cudaFree(cuda_deden[device]));
-		gpuErrchk(cudaFree(cuda_ref_positions[device]));
-		gpuErrchk(cudaFree(cuda_turn[device]));
-		gpuErrchk(cudaFree(cuda_child[device]));
-		gpuErrchk(cudaFree(cuda_dist[device]));
-		gpuErrchk(cudaFree(TEMPcuda_offsets[device]));
+		gpuErrchk(cudaFree(cuda_mesh));
+		gpuErrchk(cudaFree(cuda_crossings));
+		gpuErrchk(cudaFree(cuda_deden));
+		gpuErrchk(cudaFree(cuda_ref_positions));
+		gpuErrchk(cudaFree(cuda_turn));
+		gpuErrchk(cudaFree(cuda_child));
+		gpuErrchk(cudaFree(cuda_dist));
+		gpuErrchk(cudaFree(TEMPcuda_offsets));
 	}
 
 	delete[] TEMPoffsets;
 	delete[] deden;
 	delete[] ref_positions;
 
-	delete[] cuda_mesh;
-	delete[] cuda_crossings;
-	delete[] cuda_deden;
-	delete[] cuda_ref_positions;
-	delete[] cuda_turn;
-	delete[] cuda_child;
-	delete[] cuda_dist;
-	delete[] TEMPcuda_offsets;
-
-	time1 = std::chrono::high_resolution_clock::now();
-	printf("\tRay tracing + copying took %Lf seconds\n", (time1 - time2) / 1.0s);
-	printf("\tTotal time: %Lf seconds\n", (time1 - start_time) / 1.0s);
+	auto end_time = std::chrono::high_resolution_clock::now();
+	printf("\tTotal time: %Lf seconds\n", (end_time - start_time) / 1.0s);
 }
 
 __global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,

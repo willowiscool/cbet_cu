@@ -1,8 +1,8 @@
 CXX = g++
 NVCC = nvcc
-CXXFLAGS = -g -O3 -Wall
+CXXFLAGS = -g -O3 -Wall -fopenmp
 NVCCFLAGS = -g -O3
-NVCCFLAGS_CC = -Xcompiler -Wall
+NVCCFLAGS_CC = -Xcompiler -Wall -Xcompiler -fopenmp
 LDFLAGS = -lm -lhdf5 -lhdf5_cpp -I/usr/include/hdf5/serial -L/usr/lib/x86_64-linux-gnu/hdf5/serial
 
 all: main.o utils.o ray_trace.o
