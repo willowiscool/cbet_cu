@@ -19,6 +19,7 @@ struct Crossing {
 	double area_ratio;
 	double kds;
 	double i_b;
+	double absorption_data;
 	// double phase;
 };
 

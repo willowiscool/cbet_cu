@@ -8,6 +8,7 @@
 #include "structs.hpp"
 #include "utils.cuh"
 #include "ray_trace.hpp"
+#include "cbet.hpp"
 
 using namespace std;
 
@@ -74,7 +75,7 @@ MeshPoint* read_spherical_mesh() {
 				pt->kib *= pow(pt->eden / consts::NCRIT, 2);
 				double sqrt_dielectric = sqrt(1 - fmin(0.99, pt->eden / consts::NCRIT));
 				// this differs from c++
-				pt->kib_multiplier = 1e4 * pt->kib * pow(pt->eden/consts::NCRIT, 2) / sqrt_dielectric;
+				pt->kib_multiplier = 1e4 * pt->kib / sqrt_dielectric;
 				//pt->permittivity_multiplier = fmax(sqrt_dielectric, 0.0) * consts::OMEGA / consts::C_SPEED;
 				double mach_over_dist = interp(mach_data, r_data, consts::NR, dist) / dist;
 				pt->machnum.x = -pt->pt.x * mach_over_dist;
@@ -118,9 +119,9 @@ void save_hdf5(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		fill_n(count2, consts::GRID, 0);
 		fill_n(sheet2, consts::GRID, 0.0);
 		for (size_t raynum = 0; raynum < consts::NRAYS; raynum++) {
-			for (size_t cnum = 0; cnum < consts::NCROSSINGS; cnum++) {
-				// figure out some way to break? or, don't care about it.
-				Crossing* cross = crossings + (beamnum*consts::NRAYS + raynum)*consts::NCROSSINGS + cnum;
+			Crossing* cross = crossings + (beamnum * consts::NRAYS + raynum)*consts::NCROSSINGS;
+			size_t cnum = 0;
+			while (cross->i_b != 0) {
 				if (cnum < turn[beamnum * consts::NRAYS + raynum]) {
 					*(get_pt(sheet1, cross->boxes)) += cross->i_b;
 					*(get_pt(count1, cross->boxes)) += 1;
@@ -128,6 +129,8 @@ void save_hdf5(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 					*(get_pt(sheet2, cross->boxes)) += cross->i_b;
 					*(get_pt(count2, cross->boxes)) += 1;
 				}
+				cross++;
+				cnum++;
 			}
 		}
 		for (size_t i = 0; i < consts::GRID; i++) {
@@ -139,7 +142,22 @@ void save_hdf5(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	H5::DataSet dataset = file.createDataSet("/wplot", datatype, dataspace);
 	dataset.write(wplot, H5::PredType::NATIVE_DOUBLE);
 	// 2) compute absorption
-	// TODO (SEE CBET!!)
+	// reusing wplot variable bc why not
+	fill_n(wplot, consts::GRID, 0.0);
+	for (size_t beamnum = 0; beamnum < consts::NBEAMS; beamnum++) {
+		for (size_t raynum = 0; raynum < consts::NRAYS; raynum++) {
+			Crossing* cross = crossings + (beamnum * consts::NRAYS + raynum) * consts::NCROSSINGS;
+			while (cross->i_b != 0) {
+				*(get_pt(wplot, cross->boxes)) += cross->absorption_data;
+				cross++;
+			}
+		}
+	}
+	for (size_t i = 0; i < consts::GRID; i++) {
+		wplot[i] /= pow(consts::DX, 3);
+	}
+	dataset = file.createDataSet("/absorption", datatype, dataspace);
+	dataset.write(wplot, H5::PredType::NATIVE_DOUBLE);
 	// 3) save coordinate plots
 	// Why not just reuse x, y, z? (TEST THIS???)
 	for (size_t i = 0; i < consts::GRID; i++) wplot[i] = mesh[i].pt.x;
@@ -170,7 +188,10 @@ int main() {
 	size_t* turn = new size_t[consts::NBEAMS * consts::NRAYS];
 	printf("Starting ray tracing\n");
 	ray_trace(mesh, crossings, turn);
-	
+
+	printf("Callng cbet (just post for now)\n");
+	cbet(mesh, crossings);
+
 	printf("Writing hdf5 file\n");
 	save_hdf5(mesh, crossings, turn);
 

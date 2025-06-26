@@ -66,22 +66,40 @@ __device__ double interp3D(Xyz<double> point, Xyz<size_t> mesh_pos, Func field) 
 __device__ inline double mag(Xyz<double> pt) {
 	return sqrt(pow(pt.x, 2) + pow(pt.y, 2) + pow(pt.z, 2));
 }
-__device__ inline Xyz<size_t> get_mesh_coords(MeshPoint* mesh, Xyz<double> xyz) {
-	/*return get_mesh_coords_in_area(mesh, xyz,
-		{0, 0, 0},
-		{consts::NX-1, consts::NY-1, consts::NZ-1});*/
-	// This implementation stolen from interp3D in Shuang's code.
-	return Xyz<size_t>({ // thisx, thisy, thisz
-		(size_t)floor((xyz.x - consts::XMIN) / consts::DX),
-		(size_t)floor((xyz.y - consts::YMIN) / consts::DY),
-		(size_t)floor((xyz.z - consts::ZMIN) / consts::DZ)
-	});
-	// NOTE: May overflow, or return invalid values!
-	// Hopefully, when a trajectory is outside of the mesh,
-	// that is checked BEFORE those values are used!
+__device__ inline Xyz<size_t> get_mesh_coords_in_area(MeshPoint* mesh, Xyz<double> xyz,
+		Xyz<size_t> minpt, Xyz<size_t> maxpt) {
+	Xyz<size_t> point = {0, 0, 0};
+	for (size_t xx = minpt.x; xx <= maxpt.x; xx++) {
+		double px = get_pt(mesh, xx, 0, 0)->pt.x;
+		if ((xyz.x - px <= (1.0 + 1.0e-20)*consts::DX) &&
+			(xyz.x - px >= -(0.0 + 1.0e-20)*consts::DX)) {
+			point.x = xx;
+			break;
+		}
+	}
+	for (size_t yy = minpt.y; yy <= maxpt.y; yy++) {
+		double py = get_pt(mesh, 0, yy, 0)->pt.y;
+		if ((xyz.y - py <= (1.0 + 1.0e-20)*consts::DY) &&
+			(xyz.y - py >= -(0.0 + 1.0e-20)*consts::DY)) {
+			point.y = yy;
+			break;
+		}
+	}
+	for (size_t zz = minpt.z; zz <= maxpt.z; zz++) {
+		double pz = get_pt(mesh, 0, 0, zz)->pt.z;
+		if ((xyz.z - pz <= (1.0 + 1.0e-20)*consts::DZ) &&
+			(xyz.z - pz >= -(0.0 + 1.0e-20)*consts::DZ)) {
+			point.z = zz;
+			break;
+		}
+	}
+	return point;
 }
-//Xyz<size_t> get_mesh_coords_in_area(MeshPoint* mesh, Xyz<double> xyz,
-//		Xyz<size_t> minpt, Xyz<size_t> maxpt);
+__device__ inline Xyz<size_t> get_mesh_coords(MeshPoint* mesh, Xyz<double> xyz) {
+	return get_mesh_coords_in_area(mesh, xyz,
+		{0, 0, 0},
+		{consts::NX-1, consts::NY-1, consts::NZ-1});
+}
 __device__ Xyz<size_t> get_mesh_coords(MeshPoint* mesh, Xyz<double> xyz);
 #endif
 
