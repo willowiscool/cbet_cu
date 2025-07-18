@@ -17,7 +17,7 @@
 
 // https://stackoverflow.com/questions/14038589/what-is-the-canonical-way-to-check-for-errors-using-the-cuda-runtime-api
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=false) {
 	if (code != cudaSuccess) {
 		fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
 		if (abort) exit(code);
@@ -26,7 +26,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 using namespace std::literals; // for dividing times by 1.0s
 
-void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
+void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn, RaystorePt* raystore) {
 	auto start_time = std::chrono::high_resolution_clock::now();
 	// calculate dedens (derivative of eden wrt. x, y z)
 	Xyz<double>* deden = new Xyz<double>[consts::GRID];
@@ -85,7 +85,7 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 	size_t gpu_bytes_free = real_gpu_bytes_free -
 		((sizeof(MeshPoint) + sizeof(Xyz<double>)) * consts::GRID +
 		(sizeof(Xyz<double>) + sizeof(double)) * consts::NRAYS);
-	size_t n_beams_in_memory = gpu_bytes_free / ((sizeof(Crossing) * consts::NCROSSINGS + sizeof(size_t)) * consts::NRAYS);
+	size_t n_beams_in_memory = gpu_bytes_free / ((sizeof(Crossing) * consts::NCROSSINGS + sizeof(size_t)) * consts::NRAYS + sizeof(RaystorePt) * consts::GRID);
 	size_t n_batches = CEIL_DIV(consts::NBEAMS, n_beams_in_memory);
 
 	// make sure to use all available GPUs
@@ -104,7 +104,8 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 			i--;
 		}
 	}
-	device_count = device_ids.size();
+	//device_count = device_ids.size(); TODO
+	device_count = 1;
 	n_batches = max((int)n_batches, device_count);
 	n_beams_in_memory = CEIL_DIV(consts::NBEAMS, n_batches);
 
@@ -134,6 +135,7 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		Xyz<double>* cuda_child;
 		double* cuda_dist;
 		double* TEMPcuda_offsets;
+		RaystorePt* cuda_raystore;
 
 		gpuErrchk(cudaMalloc(&cuda_mesh, sizeof(MeshPoint) * consts::GRID));
 		gpuErrchk(cudaMemcpy(cuda_mesh, mesh, sizeof(MeshPoint) * consts::GRID, cudaMemcpyHostToDevice));
@@ -146,6 +148,9 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		gpuErrchk(cudaMemset(cuda_crossings, 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
 		gpuErrchk(cudaMalloc(&cuda_turn, sizeof(size_t) * consts::NRAYS * n_beams_in_memory));
 		gpuErrchk(cudaMemset(cuda_turn, 0, sizeof(size_t) * consts::NRAYS * n_beams_in_memory));
+
+		gpuErrchk(cudaMalloc(&cuda_raystore, sizeof(RaystorePt) * consts::GRID * n_beams_in_memory));
+		gpuErrchk(cudaMemset(cuda_raystore, 0, sizeof(RaystorePt) * consts::GRID * n_beams_in_memory));
 
 		gpuErrchk(cudaMalloc(&TEMPcuda_offsets, sizeof(double) * consts::NRAYS_X));
 		gpuErrchk(cudaMemcpy(TEMPcuda_offsets, TEMPoffsets, sizeof(double) * consts::NRAYS_X, cudaMemcpyHostToDevice));
@@ -177,7 +182,8 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 					<<<CEIL_DIV(consts::NRAYS / rays_per_thread, THREADS_PER_BLOCK), THREADS_PER_BLOCK>>>
 					(cuda_mesh, cuda_deden, cuda_child, cuda_dist,
 					 beamnum, beamnum + (batch + device) * n_beams_in_memory,
-					 cuda_ref_positions, TEMPcuda_offsets, cuda_crossings, cuda_turn, rays_per_thread);
+					 cuda_ref_positions, TEMPcuda_offsets, cuda_crossings, cuda_turn, rays_per_thread,
+					 cuda_raystore);
 				gpuErrchk(cudaPeekAtLastError());
 			}
 			gpuErrchk(cudaDeviceSynchronize());
@@ -186,6 +192,9 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 			gpuErrchk(cudaMemset(cuda_crossings, 0, sizeof(Crossing) * consts::NCROSSINGS * consts::NRAYS * n_beams_in_memory));
 			gpuErrchk(cudaMemcpy(turn + (batch + device) * n_beams_in_memory * consts::NRAYS, cuda_turn,
 				sizeof(size_t) * consts::NRAYS * n_beams_in_memory, cudaMemcpyDeviceToHost));
+			gpuErrchk(cudaMemcpy(raystore + (batch + device) * n_beams_in_memory * consts::GRID, cuda_raystore,
+				sizeof(RaystorePt) * consts::GRID * n_beams_in_memory, cudaMemcpyDeviceToHost));
+			gpuErrchk(cudaMemset(cuda_raystore, 0, sizeof(RaystorePt) * consts::GRID * n_beams_in_memory));
 		}
 
 		gpuErrchk(cudaFree(cuda_mesh));
@@ -195,6 +204,7 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 		gpuErrchk(cudaFree(cuda_turn));
 		gpuErrchk(cudaFree(cuda_child));
 		gpuErrchk(cudaFree(cuda_dist));
+		gpuErrchk(cudaFree(cuda_raystore));
 		gpuErrchk(cudaFree(TEMPcuda_offsets));
 	}
 
@@ -209,20 +219,25 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn) {
 __global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,
 		Xyz<double>* child, double* dist,
 		size_t b_mem_num, size_t beamnum, Xyz<double>* ref_positions, double* TEMPoffsets,
-		Crossing* crossings, size_t* turn, size_t rays_per_thread) {
+		Crossing* crossings, size_t* turn, size_t rays_per_thread,
+		RaystorePt* raystore) {
 	size_t thread_num = blockIdx.x*THREADS_PER_BLOCK + threadIdx.x;
 	// is this okay? will the compiler optimize this? let's hope...
 	size_t max_raynum = min(consts::NRAYS, (thread_num+1) * rays_per_thread);
-	Xyz<double> k0 = {
+	/*Xyz<double> k0 = {
 		-1 * BEAM_NORM[beamnum][0],
 		-1 * BEAM_NORM[beamnum][1],
 		-1 * BEAM_NORM[beamnum][2]
+	};*/
+	Xyz<double> k0 = {
+		consts::KX01[beamnum], consts::KY01[beamnum], consts::KZ01[beamnum]
 	};
 	Xyz<double>* child1 = child + (consts::NT * thread_num * 2);
 	Xyz<double>* child2 = child1 + consts::NT;
 	double* dist1 = dist + (consts::NT * thread_num * 2);
 	double* dist2 = dist1 + consts::NT;
 	for (size_t raynum = thread_num * rays_per_thread; raynum < max_raynum; raynum++) {
+	/*
 		// get ray start pos
 		Xyz<double>* ref_pos = &(ref_positions[raynum]);
 		Xyz<double> start_pos = *ref_pos;
@@ -244,7 +259,17 @@ __global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,
 			BEAM_NORM[beamnum][0] * consts::FOCAL_LENGTH);
 		double tmp_x0 = start_pos.x;
 		start_pos.x = start_pos.x*cos(theta2) - start_pos.y*sin(theta2);
-		start_pos.y = start_pos.y*cos(theta2) + tmp_x0*sin(theta2);
+		start_pos.y = start_pos.y*cos(theta2) + tmp_x0*sin(theta2);*/
+
+		double dx = (consts::BEAM_MAX_Z - consts::BEAM_MIN_Z)/(consts::NRAYS_X - 1);
+		Xyz<double> start_pos = {
+			consts::X01[beamnum] + consts::BEAM_MIN_Z + dx * (raynum / consts::NRAYS_X),
+			consts::Y01[beamnum],
+			consts::Z01[beamnum] + consts::BEAM_MIN_Z + dx * (raynum % consts::NRAYS_X)
+		};
+		if (beamnum == 1) {
+			start_pos = {start_pos.y, start_pos.x, start_pos.z};
+		}
 
 		// launch child rays
 		constexpr double dist = 0.2 * consts::DX;
@@ -284,14 +309,16 @@ __global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,
 		launch_parent_ray(mesh, deden,
 			child1, dist1, c1_size,
 			child2, dist2, c2_size,
-			start_pos, k0, crossings_ind, turn + b_mem_num*consts::NRAYS + raynum, TEMPinit_intensity);
+			start_pos, k0, crossings_ind, turn + b_mem_num*consts::NRAYS + raynum, TEMPinit_intensity,
+			raystore + b_mem_num*consts::GRID, raynum);
 	}
 }
 
 __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 		Xyz<double>* child1, double* dist1, size_t c1_size,
 		Xyz<double>* child2, double* dist2, size_t c2_size,
-		Xyz<double> pos, Xyz<double> k0, Crossing* crossings, size_t* turn, double TEMPintensity) {
+		Xyz<double> pos, Xyz<double> k0, Crossing* crossings, size_t* turn, double TEMPintensity,
+		RaystorePt* raystore, size_t raynum) {
 	size_t cnum = 0;
 	double max_turn_amp = 0.0;
 	size_t i_max_turn_amp = 0; // crossing index of max turn amp?
@@ -310,6 +337,7 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 			pow(ab.x * ac.y - ab.y * ac.x, 2));
 
 	Xyz<size_t> mesh_pos = get_mesh_coords(mesh, pos);
+	MeshPoint* mesh_pt = get_pt(mesh, mesh_pos);
 
 	double k = get_k(mesh, pos, mesh_pos);
 	double knorm = mag(k0);
@@ -321,8 +349,9 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 
 	double curr_dist = 0.0;
 	double kds = 0.0;
+	double next_kds = 0.0;
 	//double phase = 0.0;
-	double permittivity = 1 - get_pt(mesh, mesh_pos)->eden / consts::NCRIT;
+	double permittivity = 1 - mesh_pt->eden / consts::NCRIT;
 	if (permittivity < 0) permittivity = 0;
 
 	for (size_t _ = 1; _ < consts::NT; _++) {
@@ -369,13 +398,27 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 		// Update mesh position
 		Xyz<size_t> prev_mesh_pos = mesh_pos;
 		mesh_pos = get_mesh_coords(mesh, pos);
+		mesh_pt = get_pt(mesh, mesh_pos);
 
 		double prev_permittivity = permittivity;
-		permittivity = 1 - get_pt(mesh, mesh_pos)->eden / consts::NCRIT;
+		permittivity = 1 - mesh_pt->eden / consts::NCRIT;
 		if (permittivity < 0.0) permittivity = 0.0;
+		double distance_travelled = sqrt(pow(pos.x - prev_pos.x, 2) +
+				pow(pos.y - prev_pos.y, 2) +
+				pow(pos.z - prev_pos.z, 2));
+		// TODO: interp3d?
+		next_kds -= distance_travelled * 1e4 *
+			interp3D(pos, mesh_pos, [&] (size_t x, size_t y, size_t z) -> double {
+				return get_pt(mesh, x, y, z)->kib;
+			}) /
+			sqrt(interp3D(pos, mesh_pos, [&] (size_t x, size_t y, size_t z) -> double {
+				return get_pt(mesh, x, y, z)->dielectric;
+			}));
+		//next_kds -= distance_travelled * get_pt(mesh, mesh_pos)->kib_multiplier;
 
 		double c_perms[3];
 		double c_distances[3]; // to sort by
+		Crossing crosses[3];
 		size_t this_cnum = 0;
 
 		// 3 maximum crosses, then sorted at the end by their... boxes? x then y then z...?
@@ -383,8 +426,8 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 		// and then increments cnum.
 		auto new_crossing = [&] (Xyz<double> c_pos, Xyz<size_t> c_mesh_pos, double frac) {
 			// first, get mesh pos of crossing (cross[xyz]Ind)
-			crossings[cnum].pt = c_pos;
-			crossings[cnum].boxes = c_mesh_pos;
+			crosses[this_cnum].pt = c_pos;
+			crosses[this_cnum].boxes = c_mesh_pos;
 			// then, compute localAreaRatio, localKds, localEnergy, localPermittivity
 			double distance_to_crossing = sqrt(pow(c_pos.x - prev_pos.x, 2) +
 					pow(c_pos.y - prev_pos.y, 2) + pow(c_pos.z - prev_pos.z, 2));
@@ -394,13 +437,15 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 			Xyz<double> childp2 = interp_xyz(child2, dist2, c2_size,
 					curr_dist + distance_to_crossing);
 
+			// localPermittivity
+			c_perms[this_cnum] = frac * permittivity + (1-frac) * prev_permittivity;
+
+			// "getProjectedTriangleArea" which takes c_pos, childp1/2, interpk
 			Xyz<double> interpk = {
 				frac * vel.x + (1-frac) * prev_vel.x,
 				frac * vel.y + (1-frac) * prev_vel.y,
 				frac * vel.z + (1-frac) * prev_vel.z
 			};
-
-			// "getProjectedTriangleArea" which takes c_pos, childp1/2, interpk
 			double kmag = mag(interpk);
 			ab = {childp1.x - c_pos.x, childp1.y - c_pos.y, childp1.z - c_pos.z};
 			ac = {childp2.x - c_pos.x, childp2.y - c_pos.y, childp2.z - c_pos.z};
@@ -409,32 +454,25 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 				ab.z * ac.x - ab.x * ac.z,
 				ab.x * ac.y - ab.y * ac.x
 			};
-			//NOTE: Shuang's code has (area = 0.5 * normmag) * abs... / kmag / normmag
-			//where normmag = norm(tri_norm)
-			//I wrote 0.5 * abs... / kmag
-			//There IS a difference when I tested but that is very small
-			//(like one millionth of a percent.. but if things are broken,
-			//maybe change this first!!)
-			crossings[cnum].area_ratio = (0.5 * abs(
-					tri_norm.x * interpk.x +
-					tri_norm.y * interpk.y +
-					tri_norm.z * interpk.z) / kmag)
-				/ init_area;
-			crossings[cnum].kds = exp(kds - distance_to_crossing *
-				get_pt(mesh, c_mesh_pos)->kib_multiplier);
-			crossings[cnum].i_b = TEMPintensity * crossings[cnum].kds;
-			c_perms[this_cnum] = frac * permittivity + (1-frac) * prev_permittivity;
-			// NOTE: all of the stuff about phase is commented out in the version
-			// that Shuang gave me, but this is where it would go if it was here,
-			// and this is the line from the 2D impl.
-			// crossings[cnum].phase = phase + distance_to_crossing * meshpt.permittivity_multiplier;
+			if ((1 - c_perms[this_cnum]) < 0.8) {
+				crosses[this_cnum].area_ratio = (0.5 * abs(
+						tri_norm.x * interpk.x +
+						tri_norm.y * interpk.y +
+						tri_norm.z * interpk.z) / kmag)
+					/ init_area;
+			} else {
+				crosses[this_cnum].area_ratio = 0.5 * sqrt(pow(tri_norm.x, 2) + pow(tri_norm.y, 2) + pow(tri_norm.z, 2)) / init_area;
+			}
+			crosses[this_cnum].kds = exp(frac * next_kds + (1-frac) * kds);
+			crosses[this_cnum].i_b = TEMPintensity * crosses[this_cnum].kds;
 
-			cnum++;
 			this_cnum++;
 		};
 
-		if (mesh_pos.x != prev_mesh_pos.x) {
-			double crossx = get_pt(mesh, mesh_pos)->pt.x;
+		if ((pos.x > mesh_pt->pt.x && prev_pos.x <= mesh_pt->pt.x) ||
+				(pos.x < mesh_pt->pt.x && prev_pos.x >= mesh_pt->pt.x) ||
+				(mesh_pos.x != prev_mesh_pos.x)) {
+			double crossx = mesh_pt->pt.x;
 			if (!((pos.x > crossx && prev_pos.x <= crossx) ||
 						(pos.x < crossx && prev_pos.x >= crossx))) {
 				crossx = get_pt(mesh, prev_mesh_pos)->pt.x;
@@ -453,8 +491,10 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 				(crossx - prev_pos.x) / (pos.x - prev_pos.x) // frac
 			);
 		}
-		if (mesh_pos.y != prev_mesh_pos.y) {
-			double crossy = get_pt(mesh, mesh_pos)->pt.y;
+		if ((pos.y > mesh_pt->pt.y && prev_pos.y <= mesh_pt->pt.y) ||
+				(pos.y < mesh_pt->pt.y && prev_pos.y >= mesh_pt->pt.y) ||
+				(mesh_pos.y != prev_mesh_pos.y)) {
+			double crossy = mesh_pt->pt.y;
 			if (!((pos.y > crossy && prev_pos.y <= crossy) ||
 						(pos.y < crossy && prev_pos.y >= crossy))) {
 				crossy = get_pt(mesh, prev_mesh_pos)->pt.y;
@@ -473,8 +513,10 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 				(crossy - prev_pos.y) / (pos.y - prev_pos.y) // frac
 			);
 		}
-		if (mesh_pos.z != prev_mesh_pos.z) {
-			double crossz = get_pt(mesh, mesh_pos)->pt.z;
+		if ((pos.z > mesh_pt->pt.z && prev_pos.z <= mesh_pt->pt.z) ||
+				(pos.z < mesh_pt->pt.z && prev_pos.z >= mesh_pt->pt.z) ||
+				(mesh_pos.z != prev_mesh_pos.z)) {
+			double crossz = mesh_pt->pt.z;
 			if (!((pos.z > crossz && prev_pos.z <= crossz) ||
 						(pos.z < crossz && prev_pos.z >= crossz))) {
 				crossz = get_pt(mesh, prev_mesh_pos)->pt.z;
@@ -499,74 +541,82 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 		if (this_cnum == 3) {
 			// https://stackoverflow.com/questions/4793251/sorting-int-array-with-only-3-elements
 			// I used the second answer, which is more optimal... and ugly... SORRY!!!!
-			// distances[0] <=> crossings[cnum-3]
-			// distances[1] <=> crossings[cnum-2]
-			// distances[2] <=> crossings[cnum-1]
 			Crossing temp;
 			double temp_perm;
+			double temp_dist;
 			if (c_distances[0] < c_distances[1]) {
 				if (c_distances[1] > c_distances[2]) {
 					if (c_distances[0] < c_distances[2]) {
-						swap(crossings[cnum-2], crossings[cnum-1]);
+						swap(crosses[1], crosses[2]);
 						swap(c_perms[1], c_perms[2]);
+						swap(c_distances[1], c_distances[2]);
 					} else {
-						temp = crossings[cnum-3]; temp_perm = c_perms[0];
-						crossings[cnum-3] = crossings[cnum-1]; c_perms[0] = c_perms[2];
-						crossings[cnum-1] = crossings[cnum-2]; c_perms[2] = c_perms[1];
-						crossings[cnum-2] = temp; c_perms[1] = temp_perm;
+						temp = crosses[0]; temp_perm = c_perms[0]; temp_dist = c_distances[0];
+						crosses[0] = crosses[2]; c_perms[0] = c_perms[2]; c_distances[0] = c_distances[2];
+						crosses[2] = crosses[1]; c_perms[2] = c_perms[1]; c_distances[2] = c_distances[1];
+						crosses[1] = temp; c_perms[1] = temp_perm; c_distances[1] = temp_dist;
 					}
 				}
 			} else {
 				if (c_distances[1] < c_distances[2]) {
 					if (c_distances[0] < c_distances[2]) {
-						swap(crossings[cnum-3], crossings[cnum-2]);
+						swap(crosses[0], crosses[1]);
 						swap(c_perms[0], c_perms[1]);
+						swap(c_distances[0], c_distances[1]);
 					} else {
-						temp = crossings[cnum-3]; temp_perm = c_perms[0];
-						crossings[cnum-3] = crossings[cnum-2]; c_perms[0] = c_perms[1];
-						crossings[cnum-2] = crossings[cnum-1]; c_perms[1] = c_perms[2];
-						crossings[cnum-1] = temp; c_perms[2] = temp_perm;
+						temp = crosses[0]; temp_perm = c_perms[0]; temp_dist = c_distances[0];
+						crosses[0] = crosses[1]; c_perms[0] = c_perms[1]; c_distances[0] = c_distances[1];
+						crosses[1] = crosses[2]; c_perms[1] = c_perms[2]; c_distances[1] = c_distances[2];
+						crosses[2] = temp; c_perms[2] = temp_perm; c_distances[2] = temp_dist;
 					}
 				} else {
-					swap(crossings[cnum-3], crossings[cnum-1]);
+					swap(crosses[0], crosses[2]);
 					swap(c_perms[0], c_perms[2]);
+					swap(c_distances[0], c_distances[2]);
 				}
 			}
 		} else if (this_cnum == 2) {
 			if (c_distances[0] > c_distances[1]) {
-				swap(crossings[cnum-1], crossings[cnum-2]);
+				swap(crosses[0], crosses[1]);
 				swap(c_perms[1], c_perms[0]);
+				swap(c_distances[1], c_distances[0]);
 			}
 		}
-		for (size_t i = this_cnum; i > 0; i--) {
-			double ray_amp = 1 / (crossings[cnum-i].area_ratio * c_perms[this_cnum-i]);
+		for (size_t i = 0; i < this_cnum; i++) {
+			// calc_dk
+			if (cnum > 0) {
+				Xyz<double> dk = {
+					crosses[i].pt.x - crossings[cnum-1].pt.x,
+					crosses[i].pt.y - crossings[cnum-1].pt.y,
+					crosses[i].pt.z - crossings[cnum-1].pt.z
+				};
+				double dkmag = mag(dk);
+				if (dkmag == 0) continue;
+				crossings[cnum-1].dk = {dk.x/dkmag, dk.y/dkmag, dk.z/dkmag};
+				crossings[cnum-1].dkmag = dkmag * 10000.0;
+			}
+			crossings[cnum] = crosses[i];
+			if (crossings[cnum].boxes.x == mesh_pos.x &&
+					crossings[cnum].boxes.y == mesh_pos.y &&
+					crossings[cnum].boxes.z == mesh_pos.z) {
+				RaystorePt* rspt = get_pt(raystore, crossings[cnum].boxes);
+				if (rspt->raynum == 0 || raynum < rspt->raynum) { // TEMP WILLOW
+					rspt->raynum = raynum;
+					rspt->cnum = cnum;
+				}
+			}
+			double ray_amp = 1 / (crossings[cnum].area_ratio * c_perms[i]);
 			if (ray_amp > max_turn_amp) {
 				max_turn_amp = ray_amp;
 				i_max_turn_amp = cnum-i;
 			}
-			if (cnum-i-1 > 0)
-				calc_dk(crossings + cnum-i-1, crossings + cnum-i);
+			cnum++;
 		}
-		// update marked (TODO)
 		// update currDist, kds, totalEnergy based on step_size = distance travelled.
-		double distance_travelled = sqrt(pow(pos.x - prev_pos.x, 2) +
-				pow(pos.y - prev_pos.y, 2) +
-				pow(pos.z - prev_pos.z, 2));
 		curr_dist += distance_travelled;
-		kds -= distance_travelled * get_pt(mesh, mesh_pos)->kib_multiplier;
+		kds = next_kds;
 	}
 	return cnum;
-}
-
-__device__ void calc_dk(Crossing* cross, Crossing* cross_next) {
-	Xyz<double> dk = {
-		cross_next->pt.x - cross->pt.x,
-		cross_next->pt.y - cross->pt.y,
-		cross_next->pt.z - cross->pt.z
-	};
-	double dkmag = mag(dk);
-	cross->dk = {dk.x/dkmag, dk.y/dkmag, dk.z/dkmag};
-	cross->dkmag = dkmag * 10000.0;
 }
 
 // returns the length of the trajectory reached

@@ -2,6 +2,6 @@
 #define RAY_TRACE_HPP
 #include "structs.hpp"
 
-void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn);
+void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn, RaystorePt* raystore);
 
 #endif

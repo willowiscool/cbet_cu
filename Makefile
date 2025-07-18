@@ -2,7 +2,7 @@ HDF5_LD_FLAG := $(shell pkg-config --libs --cflags hdf5)
 CXX = mpicc
 NVCC = nvcc
 CXXFLAGS = -g -O3 -Wall -fopenmp
-NVCCFLAGS = -g -O3
+NVCCFLAGS = -g -O3 -lineinfo
 NVCCFLAGS_CC = -Xcompiler -Wall -Xcompiler -fopenmp
 LDFLAGS = -lm -lhdf5 -lhdf5_cpp -I/usr/include/hdf5/serial -L/usr/lib/x86_64-linux-gnu/hdf5/serial
 

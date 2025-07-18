@@ -73,9 +73,7 @@ MeshPoint* read_spherical_mesh() {
 				double nu_ei_c_interp = interp(nu_ei_c, r_data, consts::NR, dist);
 				pt->kib = 2 * nu_ei_c_interp * 1e12/(consts::C_SPEED * 1e4);
 				pt->kib *= pow(pt->eden / consts::NCRIT, 2);
-				double sqrt_dielectric = sqrt(1 - fmin(0.99, pt->eden / consts::NCRIT));
-				// this differs from c++
-				pt->kib_multiplier = 1e4 * pt->kib / sqrt_dielectric;
+				pt->dielectric = 1 - fmin(0.99, pt->eden / consts::NCRIT);
 				//pt->permittivity_multiplier = fmax(sqrt_dielectric, 0.0) * consts::OMEGA / consts::C_SPEED;
 				double mach_over_dist = interp(mach_data, r_data, consts::NR, dist) / dist;
 				pt->machnum.x = -pt->pt.x * mach_over_dist;
@@ -186,17 +184,19 @@ int main() {
 	printf("Allocating beam info on CPU\n");
 	Crossing* crossings = new Crossing[consts::NBEAMS * consts::NRAYS * consts::NCROSSINGS]();
 	size_t* turn = new size_t[consts::NBEAMS * consts::NRAYS];
+	RaystorePt* raystore = new RaystorePt[consts::GRID * consts::NBEAMS]();
 	printf("Starting ray tracing\n");
-	ray_trace(mesh, crossings, turn);
+	ray_trace(mesh, crossings, turn, raystore);
 
-	printf("Callng cbet (just post for now)\n");
-	cbet(mesh, crossings);
+	printf("Callng cbet\n");
+	cbet(mesh, crossings, raystore);
 
 	printf("Writing hdf5 file\n");
 	save_hdf5(mesh, crossings, turn);
 
 	delete[] crossings;
 	delete[] turn;
+	delete[] raystore;
 	delete[] mesh;
 	return 0;
 }

@@ -11,30 +11,31 @@ namespace consts {
 	// Mesh constants
 	constexpr size_t NR = 494; // for reading spherical mesh
 
-	constexpr size_t NX = 101;
-	constexpr double XMIN = -0.14;
-	constexpr double XMAX = 0.14;
+	constexpr size_t NX = 131;
+	constexpr double XMIN = -0.13;
+	constexpr double XMAX = 0.13;
 
-	constexpr size_t NY = 101;
-	constexpr double YMIN = -0.14;
-	constexpr double YMAX = 0.14;
+	constexpr size_t NY = 131;
+	constexpr double YMIN = -0.13;
+	constexpr double YMAX = 0.13;
 
-	constexpr size_t NZ = 101;
-	constexpr double ZMIN = -0.14;
-	constexpr double ZMAX = 0.14;
+	constexpr size_t NZ = 131;
+	constexpr double ZMIN = -0.13;
+	constexpr double ZMAX = 0.13;
 
 	constexpr size_t GRID = NX * NY * NZ;
 
 	constexpr double NU_EI_C = 500.0;
 
 	// Beam constants
-	constexpr size_t NBEAMS = 60;
+	constexpr size_t NBEAMS = 2;
 	constexpr size_t NCROSSINGS = NX * 3;
 	constexpr size_t RAYS_PER_ZONE = 3;
 	constexpr double BEAM_MAX_Z = 0.045;
 	constexpr double BEAM_MIN_Z = -0.045;
 
-	constexpr double FOCAL_LENGTH = 0.1;
+	// constexpr double FOCAL_LENGTH = 0.1;
+	constexpr double FOCAL_LENGTH = 0.17; // TWO BEAM
 
 	constexpr size_t NRAYS_X = (size_t)((double)RAYS_PER_ZONE * (BEAM_MAX_Z-BEAM_MIN_Z)/((ZMAX-ZMIN)/((double)NZ-1.0))+1);
 	constexpr size_t NRAYS_Y = (size_t)((double)RAYS_PER_ZONE * (BEAM_MAX_Z-BEAM_MIN_Z)/((ZMAX-ZMIN)/((double)NZ-1.0))+1);
@@ -50,7 +51,8 @@ namespace consts {
 
 	// comments copied from original c++ impl.
 	constexpr double SIGMA = 0.0375;
-	constexpr double INTENSITY = 1e14; // intensity of the beam in W/cm^2
+	// constexpr double INTENSITY = 1e14; // intensity of the beam in W/cm^2
+	constexpr double INTENSITY = 1e16; // intensity of the beam in W/cm^2 TWO BEAM
 	constexpr double COURANT_MULT = 0.2; // 0.37 // 0.25 // 0.36 // 0.22
 	constexpr double URAY_MULT = INTENSITY*COURANT_MULT*(1.0/(double)RAYS_PER_ZONE);
 	constexpr double URAY_MULT2 = 2.5*INTENSITY*COURANT_MULT*(1.0/(double)RAYS_PER_ZONE);
@@ -101,6 +103,16 @@ namespace consts {
 	// not a real const bc of sqrt
 	const double CS = 1e2*std::sqrt(EC*(Z*TE_EV+3.0*TI_EV)/MI_KG);
 	constexpr double IAW = 0.542940629585429; // ion-acoustic wave energy-damping rate (nu_ia/omega_s)!!
+
+	// TWO BEAM TESTCASE (TEMP)
+#ifdef __CUDACC__
+	__device__ constexpr double X01[] = {0.0, 0.0};
+	__device__ constexpr double Y01[] = {YMIN, XMIN};
+	__device__ constexpr double Z01[] = {0.0, 0.0};
+	__device__ constexpr double KX01[] = {0.0, 1.0};
+	__device__ constexpr double KY01[] = {1.0, 0.0};
+	__device__ constexpr double KZ01[] = {0.0, 0.0};
+#endif
 }
 
 #endif

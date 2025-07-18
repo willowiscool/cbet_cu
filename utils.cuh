@@ -21,6 +21,11 @@ inline T* get_pt(T* arr, Xyz<size_t> pt) {
 HOST_DEVICE
 double interp(double* y, double* x, size_t len, double xp);
 
+HOST_DEVICE
+inline double mag(Xyz<double> pt) {
+	return sqrt(pow(pt.x, 2) + pow(pt.y, 2) + pow(pt.z, 2));
+}
+
 #ifdef __CUDACC__
 template<typename Func>
 __device__ double interp3D(Xyz<double> point, Xyz<size_t> mesh_pos, Func field) {
@@ -63,32 +68,29 @@ __device__ double interp3D(Xyz<double> point, Xyz<size_t> mesh_pos, Func field) 
 // Needed to move these in here so they wouldn't have to be relocated
 // when CBET comes, this might? become an issue... but also might not
 // since they're already here? anyway, lmk future willow
-__device__ inline double mag(Xyz<double> pt) {
-	return sqrt(pow(pt.x, 2) + pow(pt.y, 2) + pow(pt.z, 2));
-}
 __device__ inline Xyz<size_t> get_mesh_coords_in_area(MeshPoint* mesh, Xyz<double> xyz,
 		Xyz<size_t> minpt, Xyz<size_t> maxpt) {
 	Xyz<size_t> point = {0, 0, 0};
 	for (size_t xx = minpt.x; xx <= maxpt.x; xx++) {
 		double px = get_pt(mesh, xx, 0, 0)->pt.x;
-		if ((xyz.x - px <= (1.0 + 1.0e-20)*consts::DX) &&
-			(xyz.x - px >= -(0.0 + 1.0e-20)*consts::DX)) {
+		if ((xyz.x - px <= (1.0 + 0.1e-10)*consts::DX) &&
+			(xyz.x - px >= -(0.0 + 0.1e-10)*consts::DX)) {
 			point.x = xx;
 			break;
 		}
 	}
 	for (size_t yy = minpt.y; yy <= maxpt.y; yy++) {
 		double py = get_pt(mesh, 0, yy, 0)->pt.y;
-		if ((xyz.y - py <= (1.0 + 1.0e-20)*consts::DY) &&
-			(xyz.y - py >= -(0.0 + 1.0e-20)*consts::DY)) {
+		if ((xyz.y - py <= (1.0 + 0.1e-10)*consts::DY) &&
+			(xyz.y - py >= -(0.0 + 0.1e-10)*consts::DY)) {
 			point.y = yy;
 			break;
 		}
 	}
 	for (size_t zz = minpt.z; zz <= maxpt.z; zz++) {
 		double pz = get_pt(mesh, 0, 0, zz)->pt.z;
-		if ((xyz.z - pz <= (1.0 + 1.0e-20)*consts::DZ) &&
-			(xyz.z - pz >= -(0.0 + 1.0e-20)*consts::DZ)) {
+		if ((xyz.z - pz <= (1.0 + 0.1e-10)*consts::DZ) &&
+			(xyz.z - pz >= -(0.0 + 0.1e-10)*consts::DZ)) {
 			point.z = zz;
 			break;
 		}

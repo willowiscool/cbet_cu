@@ -3,59 +3,59 @@
 <Xdmf Version="3.0">
  <Domain>
    <Grid Name="3DRectMesh" GridType="Uniform">
-     <Topology TopologyType="3DSMesh" Dimensions="101 101 101"/>
+     <Topology TopologyType="3DSMesh" Dimensions="131 131 131"/>
      <Geometry GeometryType="X_Y_Z">
-       <DataItem ItemType="HyperSlab" Dimensions="101 101 101" Type="HyperSlab">
+       <DataItem ItemType="HyperSlab" Dimensions="131 131 131" Type="HyperSlab">
          <DataItem Dimensions="3 3" Format="XML">
            0 0 0
            1 1 1
-           101 101 101
+           131 131 131
          </DataItem>
-         <DataItem Dimensions="101 101 101" NumberType="Float" Precision="8" Format="HDF">
+         <DataItem Dimensions="131 131 131" NumberType="Float" Precision="8" Format="HDF">
             edep.hdf5:/Coordinate_x
          </DataItem>
        </DataItem>
-       <DataItem ItemType="HyperSlab" Dimensions="101 101 101" Type="HyperSlab">
+       <DataItem ItemType="HyperSlab" Dimensions="131 131 131" Type="HyperSlab">
          <DataItem Dimensions="3 3" Format="XML">
            0 0 0
            1 1 1
-           101 101 101
+           131 131 131
          </DataItem>
-         <DataItem Dimensions="101 101 101" NumberType="Float" Precision="8" Format="HDF">
+         <DataItem Dimensions="131 131 131" NumberType="Float" Precision="8" Format="HDF">
             edep.hdf5:/Coordinate_y
          </DataItem>
        </DataItem>
-       <DataItem ItemType="HyperSlab" Dimensions="101 101 101" Type="HyperSlab">
+       <DataItem ItemType="HyperSlab" Dimensions="131 131 131" Type="HyperSlab">
          <DataItem Dimensions="3 3" Format="XML">
            0 0 0
            1 1 1
-           101 101 101
+           131 131 131
          </DataItem>
-         <DataItem Dimensions="101 101 101" NumberType="Float" Precision="8" Format="HDF">
+         <DataItem Dimensions="131 131 131" NumberType="Float" Precision="8" Format="HDF">
             edep.hdf5:/Coordinate_z
          </DataItem>
        </DataItem>
      </Geometry>
      <Attribute Name="wplot" AttributeType="Scalar" Center="Node">
-       <DataItem ItemType="HyperSlab" Dimensions="101 101 101" Type="HyperSlab">
+       <DataItem ItemType="HyperSlab" Dimensions="131 131 131" Type="HyperSlab">
          <DataItem Dimensions="3 3" Format="XML">
            0 0 0
            1 1 1
-           101 101 101
+           131 131 131
          </DataItem>
-         <DataItem Dimensions="101 101 101" NumberType="Float" Precision="8" Format="HDF">
+         <DataItem Dimensions="131 131 131" NumberType="Float" Precision="8" Format="HDF">
            edep.hdf5:/wplot
          </DataItem>
        </DataItem>
      </Attribute>
      <Attribute Name="absorption" AttributeType="Scalar" Center="Node">
-       <DataItem ItemType="HyperSlab" Dimensions="101 101 101" Type="HyperSlab">
+       <DataItem ItemType="HyperSlab" Dimensions="131 131 131" Type="HyperSlab">
          <DataItem Dimensions="3 3" Format="XML">
            0 0 0
            1 1 1
-           101 101 101
+           131 131 131
          </DataItem>
-         <DataItem Dimensions="101 101 101" NumberType="Float" Precision="8" Format="HDF">
+         <DataItem Dimensions="131 131 131" NumberType="Float" Precision="8" Format="HDF">
            edep.hdf5:/absorption
          </DataItem>
        </DataItem>

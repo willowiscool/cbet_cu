@@ -20,6 +20,7 @@ struct Crossing {
 	double kds;
 	double i_b;
 	double absorption_data;
+	double absorb_coeff;
 	// double phase;
 };
 
@@ -28,8 +29,26 @@ struct MeshPoint {
 	Xyz<double> machnum;
 	double eden;
 	double kib;
-	double kib_multiplier;
+	double dielectric;
 	// double permittivity_multiplier;
+};
+
+struct RaystorePt {
+	size_t raynum;
+	size_t cnum;
+};
+
+// used in CBET
+struct CbetCrosses {
+	size_t b_num;
+	size_t r_num;
+	size_t c_num;
+	size_t c_num_next;
+	double coupling_mult;
+};
+struct CbetCrossing {
+	double intensity;
+	double absorption_coeff;
 };
 
 #endif

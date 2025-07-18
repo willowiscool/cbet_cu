@@ -1,11 +1,186 @@
 #include <cstdio>
+#include <chrono>
 #include "cbet.hpp"
 #include "consts.hpp"
 #include "utils.cuh"
 #include "structs.hpp"
 
-void cbet(MeshPoint* mesh, Crossing* crossings) {
+using namespace std::literals; // for dividing times by 1.0s
+
+void cbet(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore) {
+	auto start_time = std::chrono::high_resolution_clock::now();
+	// TODO: make this use less memory by getting the minimum possible ncrossings value
+	// (and maybe even the minimum possible nbeams value for the second nbeams in cbet_crosses?)
+	printf("\tCalculating coupling multipliers\n");
+	double* coupling_mults = new double[consts::NBEAMS*consts::NRAYS*consts::NCROSSINGS*consts::NBEAMS]();
+	calc_coupling_mults(mesh, crossings, raystore, coupling_mults);
+	printf("\tRunning CBET loop\n");
+	double* w_mult_values = new double[consts::NBEAMS*consts::NRAYS*consts::NCROSSINGS]();
+	// maybe need to fill with ones?
+	double currmax = consts::MAX_INCR;
+	size_t i;
+	for (i = 1; i <= 500; i++) {
+		get_cbet_gain(crossings, raystore, coupling_mults, w_mult_values);
+		double updateconv = update_intensities(
+			crossings, raystore,
+			coupling_mults, w_mult_values, currmax);
+
+		if (updateconv <= consts::CONVERGE) break;
+		double currmaxa = consts::MAX_INCR*pow(consts::CBETCONVERGENCE, i);
+		double currmaxb = consts::CBETCONVERGENCE*updateconv;
+		currmax = fmin(currmaxa, currmaxb);
+	}
+	printf("\tIterated %lu times, running post\n", i-1);
+
 	post(mesh, crossings);
+	delete[] coupling_mults;
+
+	auto end_time = std::chrono::high_resolution_clock::now();
+	printf("\tTotal time: %Lf seconds\n", (end_time - start_time) / 1.0s);
+}
+
+void get_cbet_gain(Crossing* crossings, RaystorePt* raystore,
+		double* coupling_mults, double* w_mult_values) {
+	for (size_t beamnum = 0; beamnum < consts::NBEAMS; beamnum++) {
+		for (size_t raynum = 0; raynum < consts::NRAYS; raynum++) {
+			size_t ind_offset = (beamnum*consts::NRAYS + raynum)*consts::NCROSSINGS;
+			Crossing* cross = crossings + ind_offset;
+			double* lcl_cmults = coupling_mults + ind_offset*consts::NBEAMS;
+			double* w_mult = w_mult_values + ind_offset;
+			while (cross->i_b != 0) {
+				double cbet_sum = 0.0;
+				for (size_t o_b_num = 0; o_b_num < consts::NBEAMS; o_b_num++) {
+					if (lcl_cmults[o_b_num] == 0) continue;
+					RaystorePt* pt = get_pt(raystore + consts::GRID * o_b_num, cross->boxes);
+					Crossing* raycross = crossings + (o_b_num*consts::NRAYS + pt->raynum)*consts::NCROSSINGS + pt->cnum;
+					double avg_intensity = (raycross+1)->i_b > 0 ?
+						(raycross->i_b+(raycross+1)->i_b)/2 :
+						raycross->i_b;
+					cbet_sum += lcl_cmults[o_b_num] * avg_intensity;
+				}
+				*w_mult = exp(-1.0*cbet_sum) * cross->absorb_coeff;
+
+				cross++;
+				w_mult++;
+				lcl_cmults += consts::NBEAMS;
+			}
+		}
+	}
+}
+
+double update_intensities(Crossing* crossings, RaystorePt* raystore,
+		double* coupling_mults, double* w_mult_values, double curr_max) {
+	double conv_max = 0.0;
+	for (size_t beamnum = 0; beamnum < consts::NBEAMS; beamnum++) {
+		for (size_t raynum = 0; raynum < consts::NRAYS; raynum++) {
+			size_t ind_offset = (beamnum*consts::NRAYS + raynum)*consts::NCROSSINGS;
+			Crossing* cross = crossings + ind_offset;
+			double* lcl_w_mult = w_mult_values + ind_offset;
+			double i0 = cross->i_b;
+			double mult_acc = 1.0;
+			size_t cnum = 1;
+			lcl_w_mult++;
+			cross++;
+			while (cross->i_b != 0) {
+				double new_intensity = limit_energy(cross->i_b, i0, mult_acc, curr_max, &conv_max);
+				mult_acc *= *lcl_w_mult;
+				cross->i_b = new_intensity;
+				cross++;
+				lcl_w_mult++;
+				cnum++;
+			}
+		}
+	}
+	return conv_max;
+}
+
+double limit_energy(double i_prev, double i0, double mult_acc, double curr_max, double* max_change) {
+	double i_curr = i0*mult_acc;
+	// the fractional change in energy from imposing the update as is
+	double fractional_change = abs(i_curr-i_prev)/i_prev;
+	// update the convergence check variable
+	*max_change = fmax(fractional_change, *max_change);
+	// if the fractional change is too large, clamp the value
+	if (fractional_change > curr_max) {
+		int sign = (i_curr - i_prev > 0) ? 1 : -1;
+		double correction = 1 + curr_max*sign;
+		i_curr = i_prev*correction;
+	}
+	return i_curr;
+}
+
+// for all coupling multipliers
+void calc_coupling_mults(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore, double* coupling_mults) {
+	for (size_t beamnum = 0; beamnum < consts::NBEAMS; beamnum++) {
+		for (size_t raynum = 0; raynum < consts::NRAYS; raynum++) {
+			size_t ind_offset = (beamnum*consts::NRAYS + raynum)*consts::NCROSSINGS;
+			Crossing* cross = crossings + ind_offset;
+			double* lcl_cmults = coupling_mults + ind_offset*consts::NBEAMS;
+			size_t cnum = 0;
+			while (cross->i_b != 0) {
+				// TODO: move somewhere else or... keep here??
+				cross->absorb_coeff = (cnum == 0) ? cross->kds : cross->kds / (cross-1)->kds;
+				for (size_t o_b_num = 0; o_b_num < consts::NBEAMS; o_b_num++) {
+					if (o_b_num == beamnum) continue;
+					RaystorePt* pt = get_pt(raystore + consts::GRID * o_b_num, cross->boxes);
+					if (pt->cnum == 0 && pt->raynum == 0) continue;
+					lcl_cmults[o_b_num] = get_coupling_mult(
+						mesh, cross,
+						crossings + (o_b_num*consts::NRAYS + pt->raynum)*consts::NCROSSINGS + pt->cnum);
+				}
+
+				cross++;
+				cnum++;
+				lcl_cmults += consts::NBEAMS;
+			}
+		}
+	}
+}
+
+// for one coupling multiplier
+double get_coupling_mult(MeshPoint* mesh, Crossing* cross, Crossing* raycross) {
+	// copied in wholesale from Shuang
+	MeshPoint* mesh_pt = get_pt(mesh, cross->boxes);
+	double area_avg = (raycross+1)->i_b != 0 ?
+		(raycross->area_ratio+(raycross+1)->area_ratio)/2.0 :
+		raycross->area_ratio;
+	double ne_over_nc = mesh_pt->eden;
+	if (ne_over_nc > consts::NCRIT) ne_over_nc = 0.99;
+	else ne_over_nc = ne_over_nc / consts::NCRIT;
+	double ne_over_nc_corrected = fmin(ne_over_nc, 1.0); // TODO can remove?
+	double ne_term = sqrt(1 - ne_over_nc_corrected);
+	double epsilon_eff = ne_term * ne_term;
+	double interaction_mult = 1/(area_avg*ne_term)*1/sqrt(epsilon_eff);
+
+	Xyz<double> k_seed = cross->dk;
+	Xyz<double> k_pump = raycross->dk;
+
+	double omega1 = consts::OMEGA, omega2 = consts::OMEGA;
+
+	Xyz<double> iaw_vector = {
+		(omega1*k_seed.x - omega2*k_pump.x)*sqrt(1-ne_over_nc)/consts::C_SPEED,
+		(omega1*k_seed.y - omega2*k_pump.y)*sqrt(1-ne_over_nc)/consts::C_SPEED,
+		(omega1*k_seed.z - omega2*k_pump.z)*sqrt(1-ne_over_nc)/consts::C_SPEED
+	};
+	double k_iaw = mag(iaw_vector);
+	double eta_numerator = omega1-omega2 -
+		(iaw_vector.x * mesh_pt->machnum.x +
+		 iaw_vector.y * mesh_pt->machnum.y + 
+		 iaw_vector.z * mesh_pt->machnum.z) * consts::CS;
+	double eta_denominator = k_iaw * consts::CS;
+	double eta = eta_numerator/eta_denominator;
+
+	// THIS ONE IS CONSTANT TODO MOVE TO CONSTS...
+	double param1 = consts::CBET_CONST / (consts::OMEGA*(consts::TE_EV/1e3 + 3.0 * consts::TI_EV/1e3/consts::Z));
+	double param2 = ne_over_nc/consts::IAW*consts::IAW*consts::IAW*eta;
+	double param3 = pow(eta*eta-1.0, 2) + consts::IAW*consts::IAW*eta*eta;
+	double param4 = interaction_mult;
+
+	double coupling_mult = param1*param2/param3*param4*cross->dkmag;
+	// Random polarization
+	coupling_mult *= (1 + pow(k_seed.x * k_pump.x + k_seed.y * k_pump.y + k_seed.z * k_pump.z, 2)) / 4;
+	
+	return coupling_mult;
 }
 
 void post(MeshPoint* mesh, Crossing* crossings) {
@@ -21,7 +196,7 @@ void post(MeshPoint* mesh, Crossing* crossings) {
 				double ne_over_nc = get_pt(mesh, cross->boxes)->eden;
 				if (ne_over_nc > consts::NCRIT) ne_over_nc = 9.04e21; // hard coded??
 				ne_over_nc = ne_over_nc / consts::NCRIT;
-				double ne_over_nc_corrected = fmin(ne_over_nc, 1.0);
+				double ne_over_nc_corrected = fmin(ne_over_nc, 1.0); // TODO can remove?
 				double ne_term = sqrt(1 - ne_over_nc_corrected);
 				double epsilon_eff = ne_term * ne_term;
 				double interaction_mult = 1/(area_avg*ne_term)*1/sqrt(epsilon_eff);
