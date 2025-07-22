@@ -27,6 +27,19 @@ inline double mag(Xyz<double> pt) {
 }
 
 #ifdef __CUDACC__
+
+#include <iostream>
+// https://stackoverflow.com/questions/14038589/what-is-the-canonical-way-to-check-for-errors-using-the-cuda-runtime-api
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
+	if (code != cudaSuccess) {
+		fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+		if (abort) exit(code);
+	}
+}
+
+#define CEIL_DIV(a, b) ((a+b-1)/b)
+
 template<typename Func>
 __device__ double interp3D(Xyz<double> point, Xyz<size_t> mesh_pos, Func field) {
 	Xyz<double> pos = { // xp, yp, zp

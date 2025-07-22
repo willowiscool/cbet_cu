@@ -12,17 +12,7 @@
 #include "utils.cuh"
 #include "omega_beams.cuh"
 
-#define CEIL_DIV(a, b) ((a+b-1)/b)
 #define THREADS_PER_BLOCK 256
-
-// https://stackoverflow.com/questions/14038589/what-is-the-canonical-way-to-check-for-errors-using-the-cuda-runtime-api
-#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=false) {
-	if (code != cudaSuccess) {
-		fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-		if (abort) exit(code);
-	}
-}
 
 using namespace std::literals; // for dividing times by 1.0s
 
@@ -104,8 +94,7 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn, RaystorePt* r
 			i--;
 		}
 	}
-	//device_count = device_ids.size(); TODO
-	device_count = 1;
+	device_count = device_ids.size();
 	n_batches = max((int)n_batches, device_count);
 	n_beams_in_memory = CEIL_DIV(consts::NBEAMS, n_batches);
 
@@ -224,20 +213,21 @@ __global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,
 	size_t thread_num = blockIdx.x*THREADS_PER_BLOCK + threadIdx.x;
 	// is this okay? will the compiler optimize this? let's hope...
 	size_t max_raynum = min(consts::NRAYS, (thread_num+1) * rays_per_thread);
-	/*Xyz<double> k0 = {
+	Xyz<double> k0 = {
 		-1 * BEAM_NORM[beamnum][0],
 		-1 * BEAM_NORM[beamnum][1],
 		-1 * BEAM_NORM[beamnum][2]
-	};*/
-	Xyz<double> k0 = {
-		consts::KX01[beamnum], consts::KY01[beamnum], consts::KZ01[beamnum]
 	};
+	// TWO BEAM
+	
+	/*Xyz<double> k0 = {
+		consts::KX01[beamnum], consts::KY01[beamnum], consts::KZ01[beamnum]
+	};*/
 	Xyz<double>* child1 = child + (consts::NT * thread_num * 2);
 	Xyz<double>* child2 = child1 + consts::NT;
 	double* dist1 = dist + (consts::NT * thread_num * 2);
 	double* dist2 = dist1 + consts::NT;
 	for (size_t raynum = thread_num * rays_per_thread; raynum < max_raynum; raynum++) {
-	/*
 		// get ray start pos
 		Xyz<double>* ref_pos = &(ref_positions[raynum]);
 		Xyz<double> start_pos = *ref_pos;
@@ -259,9 +249,11 @@ __global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,
 			BEAM_NORM[beamnum][0] * consts::FOCAL_LENGTH);
 		double tmp_x0 = start_pos.x;
 		start_pos.x = start_pos.x*cos(theta2) - start_pos.y*sin(theta2);
-		start_pos.y = start_pos.y*cos(theta2) + tmp_x0*sin(theta2);*/
+		start_pos.y = start_pos.y*cos(theta2) + tmp_x0*sin(theta2);
 
-		double dx = (consts::BEAM_MAX_Z - consts::BEAM_MIN_Z)/(consts::NRAYS_X - 1);
+		// TWO BEAM
+		
+		/*double dx = (consts::BEAM_MAX_Z - consts::BEAM_MIN_Z)/(consts::NRAYS_X - 1);
 		Xyz<double> start_pos = {
 			consts::X01[beamnum] + consts::BEAM_MIN_Z + dx * (raynum / consts::NRAYS_X),
 			consts::Y01[beamnum],
@@ -269,7 +261,7 @@ __global__ void trace_rays(MeshPoint* mesh, Xyz<double>* deden,
 		};
 		if (beamnum == 1) {
 			start_pos = {start_pos.y, start_pos.x, start_pos.z};
-		}
+		}*/
 
 		// launch child rays
 		constexpr double dist = 0.2 * consts::DX;
@@ -594,6 +586,9 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 				if (dkmag == 0) continue;
 				crossings[cnum-1].dk = {dk.x/dkmag, dk.y/dkmag, dk.z/dkmag};
 				crossings[cnum-1].dkmag = dkmag * 10000.0;
+				crosses[i].absorb_coeff = crosses[i].kds / crossings[cnum-1].kds;
+			} else {
+				crosses[i].absorb_coeff = crosses[i].kds;
 			}
 			crossings[cnum] = crosses[i];
 			if (crossings[cnum].boxes.x == mesh_pos.x &&

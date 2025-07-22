@@ -15,8 +15,8 @@ main.o: main.cpp consts.hpp structs.hpp utils.cuh ray_trace.cuh
 utils.o: utils.cu consts.hpp structs.hpp utils.cuh
 	$(NVCC) $(NVCCFLAGS) $(NVCCFLAGS_CC) -c utils.cu $(LDFLAGS)
 
-ray_trace.o: ray_trace.cu ray_trace.cuh consts.hpp structs.hpp utils.cuh
+ray_trace.o: ray_trace.cu ray_trace.hpp ray_trace.cuh consts.hpp structs.hpp utils.cuh
 	$(NVCC) $(NVCCFLAGS) $(NVCCFLAGS_CC) -c ray_trace.cu $(LDFLAGS)
 
-cbet.o: cbet.cpp cbet.hpp structs.hpp consts.hpp
-	$(CXX) $(CXXFLAGS) -c cbet.cpp $(LDFLAGS)
+cbet.o: cbet.cu cbet.hpp cbet.cuh structs.hpp consts.hpp
+	$(NVCC) $(NVCCFLAGS) $(NVCCFLAGS_CC) -c cbet.cu $(LDFLAGS)
