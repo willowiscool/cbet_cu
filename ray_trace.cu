@@ -77,6 +77,7 @@ void ray_trace(MeshPoint* mesh, Crossing* crossings, size_t* turn, RaystorePt* r
 		(sizeof(Xyz<double>) + sizeof(double)) * consts::NRAYS);
 	size_t n_beams_in_memory = gpu_bytes_free / ((sizeof(Crossing) * consts::NCROSSINGS + sizeof(size_t)) * consts::NRAYS + sizeof(RaystorePt) * consts::GRID);
 	size_t n_batches = CEIL_DIV(consts::NBEAMS, n_beams_in_memory);
+	if (n_batches % 2 == 1) n_batches++;
 
 	// make sure to use all available GPUs
 	int device_count;

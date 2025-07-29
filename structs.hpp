@@ -38,17 +38,4 @@ struct RaystorePt {
 	size_t cnum;
 };
 
-// used in CBET
-struct CbetCrosses {
-	size_t b_num;
-	size_t r_num;
-	size_t c_num;
-	size_t c_num_next;
-	double coupling_mult;
-};
-struct CbetCrossing {
-	double intensity;
-	double absorption_coeff;
-};
-
 #endif

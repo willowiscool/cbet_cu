@@ -1,5 +1,7 @@
 #include <cstdio>
 #include <chrono>
+#include <cub/cub.cuh>
+#include <cuda.h>
 #include "cbet.hpp"
 #include "cbet.cuh"
 #include "consts.hpp"
@@ -18,11 +20,15 @@ void cbet(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore) {
 	double* w_mult_values = new double[consts::NBEAMS*consts::NRAYS*consts::NCROSSINGS]();*/
 
 	auto start_time = std::chrono::high_resolution_clock::now();
-	
+
+	printf("\tAllocating and copying to GPU\n");
+
 	MeshPoint* cuda_mesh;
 	Crossing* cuda_crossings;
 	RaystorePt* cuda_raystore;
 	double* cuda_w_mult_values;
+	CmultBounds* cuda_cmult_bounds;
+	Cmult* cuda_cmults;
 
 	gpuErrchk(cudaMalloc(&cuda_mesh, sizeof(MeshPoint) * consts::GRID));
 	gpuErrchk(cudaMemcpy(cuda_mesh, mesh, sizeof(MeshPoint) * consts::GRID, cudaMemcpyHostToDevice));
@@ -32,24 +38,40 @@ void cbet(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore) {
 	gpuErrchk(cudaMemcpy(cuda_raystore, raystore, sizeof(RaystorePt) * consts::GRID * consts::NBEAMS, cudaMemcpyHostToDevice));
 	gpuErrchk(cudaMalloc(&cuda_w_mult_values, sizeof(double) * consts::NBEAMS * consts::NRAYS * consts::NCROSSINGS));
 	gpuErrchk(cudaMemset(cuda_w_mult_values, 0, sizeof(double) * consts::NBEAMS * consts::NRAYS * consts::NCROSSINGS));
+	gpuErrchk(cudaMalloc(&cuda_cmult_bounds, sizeof(CmultBounds) * consts::NBEAMS * consts::NRAYS * consts::NCROSSINGS));
+	gpuErrchk(cudaDeviceSynchronize());
 
-	// fill remaining memory with coupling multipliers
-	// another smart thing to do would be to have indices associated w/ each one
-	// so we don't get a bunch of zeroes...
+	printf("\tGetting the number of cmults needed\n");
+
+	size_t num_cmults_needed;
+	size_t* cuda_num_cmults;
+	gpuErrchk(cudaMalloc(&cuda_num_cmults, sizeof(size_t)));
+	gpuErrchk(cudaMemset(cuda_num_cmults, 0, sizeof(size_t)));
+	get_num_cmults
+		<<<CEIL_DIV(consts::NRAYS * consts::NBEAMS, THREADS_PER_BLOCK), THREADS_PER_BLOCK>>>
+		(cuda_crossings, cuda_raystore, cuda_num_cmults);
+	gpuErrchk(cudaPeekAtLastError());
+	gpuErrchk(cudaDeviceSynchronize());
+	gpuErrchk(cudaMemcpy(&num_cmults_needed, cuda_num_cmults, sizeof(size_t), cudaMemcpyDeviceToHost));
+
+	// now let's see how many we can actually fit
 	size_t gpu_bytes_free;
 	gpuErrchk(cudaDeviceSynchronize());
 	gpuErrchk(cudaMemGetInfo(&gpu_bytes_free, NULL));
-	size_t num_cmults = gpu_bytes_free / sizeof(double);
-	num_cmults -= 1<<19;
-	double* cuda_coupling_mults;
-	gpuErrchk(cudaMalloc(&cuda_coupling_mults, sizeof(double) * num_cmults));
-	gpuErrchk(cudaMemset(cuda_coupling_mults, 0, sizeof(double) * num_cmults));
-	size_t total_cmults = consts::NBEAMS*consts::NRAYS*consts::NCROSSINGS*consts::NRAYS;
-	printf("\tCalculating and saving %lu/%lu coupling mults (%lf%%)\n",
-			num_cmults, total_cmults, (double)num_cmults/(double)total_cmults);
+	size_t num_cmults = gpu_bytes_free / sizeof(Cmult);
+	num_cmults -= num_cmults % consts::NRAYS * consts::NBEAMS; // trunc
+	size_t num_cmults_per_ray = num_cmults / (consts::NRAYS * consts::NBEAMS);
+	num_cmults_per_ray = min(num_cmults_per_ray, num_cmults_needed);
+	num_cmults = num_cmults_per_ray * consts::NRAYS * consts::NBEAMS;
+	printf("\tCalculating %lu cmults, which is %lu per ray, out of a maximum required %lu cmults per ray\n", num_cmults, num_cmults_per_ray, num_cmults_needed);
+	gpuErrchk(cudaMalloc(&cuda_cmults, sizeof(Cmult) * num_cmults));
+	gpuErrchk(cudaMemset(cuda_cmults, 0, sizeof(Cmult) * num_cmults));
+
+
 	calc_coupling_mults
-		<<<CEIL_DIV(num_cmults / (consts::NBEAMS*consts::NCROSSINGS), THREADS_PER_BLOCK), THREADS_PER_BLOCK>>>
-		(cuda_mesh, cuda_crossings, cuda_raystore, cuda_coupling_mults, num_cmults);
+		<<<CEIL_DIV(consts::NRAYS * consts::NBEAMS, THREADS_PER_BLOCK), THREADS_PER_BLOCK>>>
+		(cuda_mesh, cuda_crossings, cuda_raystore,
+		 cuda_cmult_bounds, cuda_cmults, num_cmults_per_ray);
 	gpuErrchk(cudaPeekAtLastError());
 	gpuErrchk(cudaDeviceSynchronize());
 
@@ -66,7 +88,7 @@ void cbet(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore) {
 		get_cbet_gain
 			<<<CEIL_DIV(consts::NRAYS * consts::NBEAMS, THREADS_PER_BLOCK), THREADS_PER_BLOCK>>>
 			(cuda_mesh, cuda_crossings, cuda_raystore, cuda_w_mult_values,
-			 cuda_coupling_mults, num_cmults);
+			 cuda_cmult_bounds, cuda_cmults, num_cmults_per_ray);
 		gpuErrchk(cudaPeekAtLastError());
 		gpuErrchk(cudaDeviceSynchronize());
 
@@ -100,34 +122,70 @@ void cbet(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore) {
 	printf("\tTotal time: %Lf seconds\n", (end_time - start_time) / 1.0s);
 }
 
-__global__ void get_cbet_gain(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore,
-		double* w_mult_values, double* coupling_mults, size_t num_cmults) {
+// gets the number of cmults needed per ray (max of all rays)
+__global__ void get_num_cmults(Crossing* crossings, RaystorePt* raystore, size_t* num_cmults) {
+	size_t thread_num = blockIdx.x*THREADS_PER_BLOCK + threadIdx.x;
+	__shared__ size_t block_crossings[THREADS_PER_BLOCK];
+	block_crossings[threadIdx.x] = 0;
+	if (thread_num > consts::NBEAMS * consts::NRAYS) return;
+	size_t ncrossings = 0;
+	Crossing* cross = crossings + (thread_num)*consts::NCROSSINGS;
+	while (cross->i_b != 0) {
+		for (size_t o_b_num = 0; o_b_num < consts::NBEAMS; o_b_num++) {
+			if (o_b_num == thread_num / consts::NRAYS) continue;
+			RaystorePt* pt = get_pt(raystore + consts::GRID * o_b_num, cross->boxes);
+			if (pt->cnum != 0 && pt->raynum != 0) ncrossings++;
+		}
+		cross++;
+	}
+	block_crossings[threadIdx.x] = ncrossings;
+	using BlockReduce = cub::BlockReduce<size_t, THREADS_PER_BLOCK>;
+	__shared__ typename BlockReduce::TempStorage temp_storage;
+	ncrossings = BlockReduce(temp_storage).Reduce(block_crossings, Max<size_t>{});
+	if (threadIdx.x == 0) *num_cmults = max(ncrossings, *num_cmults);
+}
+
+__global__ void get_cbet_gain(MeshPoint* mesh, Crossing* crossings,
+		RaystorePt* raystore, double* w_mult_values,
+		CmultBounds* cmult_bounds, Cmult* cmults, size_t num_cmults_per_ray) {
 	size_t thread_num = blockIdx.x*THREADS_PER_BLOCK + threadIdx.x;
 	if (thread_num > consts::NBEAMS * consts::NRAYS) return;
 
 	size_t ind_offset = (thread_num)*consts::NCROSSINGS;
 	Crossing* cross = crossings + ind_offset;
 	double* w_mult = w_mult_values + ind_offset;
-	ind_offset *= consts::NBEAMS; // from now on stores cmult index
+	CmultBounds* bounds = cmult_bounds + ind_offset;
+	cmults += thread_num * num_cmults_per_ray;
 	while (cross->i_b != 0) {
 		double cbet_sum = 0.0;
-		for (size_t o_b_num = 0; o_b_num < consts::NBEAMS; o_b_num++) {
-			if (o_b_num == thread_num / consts::NRAYS) continue;
-			RaystorePt* pt = get_pt(raystore + consts::GRID * o_b_num, cross->boxes);
-			if (pt->cnum == 0 && pt->raynum == 0) continue;
-			Crossing* raycross = crossings + (o_b_num*consts::NRAYS + pt->raynum)*consts::NCROSSINGS + pt->cnum;
-			double avg_intensity = (raycross+1)->i_b > 0 ?
-				(raycross->i_b+(raycross+1)->i_b)/2 :
-				raycross->i_b;
-			double coupling_mult = (ind_offset + o_b_num) > num_cmults ?
-				get_coupling_mult(mesh, cross, raycross) :
-				coupling_mults[ind_offset + o_b_num];
-			cbet_sum += coupling_mult * avg_intensity;
+		// if calculated
+		if (bounds->start <= num_cmults_per_ray) {
+			for (size_t i = 0; i < bounds->size; i++) {
+				size_t o_b_num = cmults[i + bounds->start].beamnum;
+				RaystorePt* pt = get_pt(raystore + consts::GRID * o_b_num, cross->boxes);
+				Crossing* raycross = crossings + (o_b_num*consts::NRAYS + pt->raynum)*consts::NCROSSINGS + pt->cnum;
+				double avg_intensity = (raycross+1)->i_b > 0 ?
+					(raycross->i_b+(raycross+1)->i_b)/2 :
+					raycross->i_b;
+				cbet_sum += cmults[i + bounds->start].coupling_mult * avg_intensity;
+			}
+		} else {
+			for (size_t o_b_num = 0; o_b_num < consts::NBEAMS; o_b_num++) {
+				if (o_b_num == thread_num / consts::NRAYS) continue;
+				RaystorePt* pt = get_pt(raystore + consts::GRID * o_b_num, cross->boxes);
+				if (pt->cnum == 0 && pt->raynum == 0) continue;
+				Crossing* raycross = crossings + (o_b_num*consts::NRAYS + pt->raynum)*consts::NCROSSINGS + pt->cnum;
+				double avg_intensity = (raycross+1)->i_b > 0 ?
+					(raycross->i_b+(raycross+1)->i_b)/2 :
+					raycross->i_b;
+				double coupling_mult = get_coupling_mult(mesh, cross, raycross);
+				cbet_sum += coupling_mult * avg_intensity;
+			}
 		}
 		*w_mult = exp(-1.0*cbet_sum) * cross->absorb_coeff;
 
-		ind_offset += consts::NBEAMS;
 		cross++;
+		bounds++;
 		w_mult++;
 	}
 }
@@ -135,6 +193,8 @@ __global__ void get_cbet_gain(MeshPoint* mesh, Crossing* crossings, RaystorePt* 
 __global__ void update_intensities(Crossing* crossings, RaystorePt* raystore,
 		double* w_mult_values, double curr_max, double* updateconv) {
 	size_t thread_num = blockIdx.x*THREADS_PER_BLOCK + threadIdx.x;
+	__shared__ double conv_values[THREADS_PER_BLOCK];
+	conv_values[threadIdx.x] = 0;
 	if (thread_num > consts::NBEAMS * consts::NRAYS) return;
 
 	double conv_max = 0.0;
@@ -154,7 +214,12 @@ __global__ void update_intensities(Crossing* crossings, RaystorePt* raystore,
 		lcl_w_mult++;
 		cnum++;
 	}
-	if (conv_max > *updateconv) *updateconv = conv_max;
+	conv_values[threadIdx.x] = conv_max;
+
+	using BlockReduce = cub::BlockReduce<double, THREADS_PER_BLOCK>;
+	__shared__ typename BlockReduce::TempStorage temp_storage;
+	conv_max = BlockReduce(temp_storage).Reduce(conv_values, Max<double>{});
+	if (threadIdx.x == 0 && conv_max > *updateconv) *updateconv = conv_max;
 }
 
 __device__ double limit_energy(double i_prev, double i0, double mult_acc, double curr_max, double* max_change) {
@@ -172,31 +237,44 @@ __device__ double limit_energy(double i_prev, double i0, double mult_acc, double
 	return i_curr;
 }
 
-// for all coupling multipliers
-// UNUSED!!
-__global__ void calc_coupling_mults(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore, double* coupling_mults, size_t num_cmults) {
+__global__ void calc_coupling_mults(MeshPoint* mesh, Crossing* crossings, RaystorePt* raystore,
+		CmultBounds* cmult_bounds, Cmult* cmults, size_t num_cmults_per_ray) {
 	size_t thread_num = blockIdx.x*THREADS_PER_BLOCK + threadIdx.x;
-	size_t ind_offset = thread_num*consts::NCROSSINGS;
-	if (ind_offset*consts::NBEAMS >= num_cmults) return;
+	if (thread_num > consts::NRAYS*consts::NBEAMS) return;
 
-	Crossing* cross = crossings + ind_offset;
-	ind_offset *= consts::NBEAMS;
-	if (ind_offset >= num_cmults) return;
-	size_t cnum = 0;
-	while (cross->i_b != 0) {
+	Crossing* cross = crossings + thread_num*consts::NCROSSINGS;
+	CmultBounds* bounds = cmult_bounds + thread_num*consts::NCROSSINGS;
+	Cmult* cmult_ptr = cmults + thread_num*num_cmults_per_ray;
+	size_t cmult_num = 0;
+
+	while (cross->i_b != 0 && cmult_num < num_cmults_per_ray) {
+		bounds->start = cmult_num;
 		for (size_t o_b_num = 0; o_b_num < consts::NBEAMS; o_b_num++) {
 			if (o_b_num == thread_num / consts::NRAYS) continue;
-			if (ind_offset + o_b_num >= num_cmults) return;
 			RaystorePt* pt = get_pt(raystore + consts::GRID * o_b_num, cross->boxes);
 			if (pt->cnum == 0 && pt->raynum == 0) continue;
-			coupling_mults[ind_offset + o_b_num] = get_coupling_mult(
+			cmult_ptr->coupling_mult = get_coupling_mult(
 				mesh, cross,
 				crossings + (o_b_num*consts::NRAYS + pt->raynum)*consts::NCROSSINGS + pt->cnum);
+			cmult_ptr->beamnum = o_b_num;
+			cmult_num++;
+			cmult_ptr++;
+			if (cmult_num >= num_cmults_per_ray) {
+				// so it knows all need to be calculated
+				bounds->start = num_cmults_per_ray+1;
+				break;
+			}
 		}
+		bounds->size = cmult_num - bounds->start;
 
 		cross++;
-		cnum++;
-		ind_offset += consts::NBEAMS;
+		bounds++;
+	}
+	// make sure rest are blanked
+	while (cross->i_b != 0) {
+		bounds->start = num_cmults_per_ray+1;
+		bounds++;
+		cross++;
 	}
 }
 
