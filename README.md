@@ -6,6 +6,15 @@ This file contains some documentation on how the code works, in case anyone migh
 
 Each beam is represented as a set of rays (and crossings between those rays and the mesh), and the plasma is represented as a linearly spaced mesh.
 
+## Running it
+
+```
+$ make
+$ ./cbet
+```
+
+Depends on CUDA, OpenMP, and HDF5 libraries. HDF5 must be compiled with OpenMP and C++ support.
+
 ## Files
 
 * `main.cpp` - The main file, which is the entry point into the program. It contains functions to read the mesh profile and save the result to an HDF5 file.
@@ -13,6 +22,7 @@ Each beam is represented as a set of rays (and crossings between those rays and 
 * `utils.cu*` - Utility functions used throughout the program. Some of them are implemented in the header file, so that they can be used across multiple CUDA files without having to generate relocatable device code in the CUDA compilation (which can impact performance).
 * `ray_trace.*` - Ray tracing code. Uses CUDA and OpenMP. Finds the trajectories of the rays and saves in memory each crossing between each ray and the mesh zones.
 * `cbet.*` - CBET implementation. Uses an iterative process to get the resulting laser intensities. Uses CUDA.
+* `omega_beams.cuh`, `output_*` - contain the beam configuration and mesh profile used.
 
 ## Ray Tracing
 
