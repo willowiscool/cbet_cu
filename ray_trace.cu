@@ -596,10 +596,6 @@ __device__ size_t launch_parent_ray(MeshPoint* mesh, Xyz<double>* deden,
 					crossings[cnum].boxes.y == mesh_pos.y &&
 					crossings[cnum].boxes.z == mesh_pos.z) {
 				RaystorePt* rspt = get_pt(raystore, crossings[cnum].boxes);
-				if (rspt->raynum == 0 || raynum < rspt->raynum) { // TEMP WILLOW
-					rspt->raynum = raynum;
-					rspt->cnum = cnum;
-				}
 			}
 			double ray_amp = 1 / (crossings[cnum].area_ratio * c_perms[i]);
 			if (ray_amp > max_turn_amp) {
